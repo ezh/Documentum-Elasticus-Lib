@@ -1,5 +1,5 @@
 target/**
-!/target/.keep
+#!/target/.keep
 *.log
 *.log.xml
 
