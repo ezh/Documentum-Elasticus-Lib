@@ -15,8 +15,10 @@ libraryDependencies ++= {
     "pircbot" % "pircbot" % "1.5.0",
     "org.igniterealtime.smack" % "smack" % "3.2.1",
     "org.igniterealtime.smack" % "smackx" % "3.2.1",
+    "org.igniterealtime.smack" % "smackx-jingle" % "3.2.1",
     "org.apache.httpcomponents" % "httpclient" % "4.1.2",
-    "org.bouncycastle" % "bcpg-jdk16" % "1.46"
+    "org.bouncycastle" % "bcpg-jdk16" % "1.46",
+    "org.scala-lang" % "scalap" % "2.9.1"
 //    "org.jasypt" % "jasypt" % "1.8"
   )
 }
@@ -29,3 +31,5 @@ libraryDependencies ++= {
     "oo" % "jurt" % officeversion from "%s/jurt.jar".format(ure),
     "oo" % "unoil" % officeversion from "%s/unoil.jar".format(basis),
 */
+
+scalacOptions ++= Seq("-deprecation", "-unchecked")

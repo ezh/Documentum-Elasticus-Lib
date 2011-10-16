@@ -44,31 +44,34 @@
  *
  */
 
-package org.digimead.documentumelasticus
+package org.digimead.documentumelasticus.hexapod
+import de.javawi.jstun.util.Address
 
 import java.io.{ File, FileWriter, PrintWriter }
 import java.util.UUID
 import java.util.concurrent.atomic.{ AtomicBoolean, AtomicLong }
-import org.digimead.documentumelasticus.archinid.Bot
-import org.digimead.documentumelasticus.helper.{ Config, OpenPGP, Publisher, SubscribeSelf }
+import org.digimead.documentumelasticus.helper.Config
+import org.digimead.documentumelasticus.helper.Publisher
+import org.digimead.documentumelasticus.helper.SubscribeSelf
+import org.digimead.documentumelasticus.helper.openpgp.OpenPGP
 import org.digimead.documentumelasticus.helper.openpgp.{ KeySet, Locked, Unlocked }
+import org.digimead.documentumelasticus.hexapod.bot.Bot
+import org.digimead.documentumelasticus.hexapod.bot.BotEvent
 import org.slf4j.{ Logger, LoggerFactory }
 import scala.actors.Futures.future
 import scala.actors.threadpool.AtomicInteger
 import scala.collection.mutable.{ HashMap, ObservableMap, Subscriber, SynchronizedMap, Undoable }
-import scala.collection.script.Message
+//import scala.collection.script.Message
 import scala.io.BufferedSource
 
-package hexapod {
-  sealed trait Event
-  case class Changed(reason: String, uuid: UUID, kind: String, bot: Bot)
-}
+sealed trait HexapodEvent
+case class HexapodChanged(reason: String, uuid: UUID, kind: String, bot: Bot)
 
 class Hexapod(val uuid: UUID, val kind: String = "hexapod", val log: Logger = LoggerFactory.getLogger(getClass.getName)) {
   protected var instance: AnyRef = initialize
   Hexapod.publishFromCompanion(Hexapod.Event.New(this))
-  protected def initialize: AnyRef = new InstanceH(uuid, kind, log, this)
-  class InstanceH(val uuid: UUID, val kind: String, val log: Logger, val box: Hexapod) extends Publisher[hexapod.Changed] {
+  protected def initialize: AnyRef = new InstanceH(uuid, None, None, kind, log, this)
+  class InstanceH(val uuid: UUID, var publicIP: Option[Address], var consolePort: Option[Int], val kind: String, val log: Logger, val box: Hexapod) extends Publisher[HexapodChanged] {
     val entity = new HashMap[Bot, BotEntity] with SynchronizedMap[Bot, BotEntity]
     private var subscribers = Seq[Tuple2[Bot, Subscriber[_, _]]]()
     if (Hexapod.hexapod.isDefinedAt(uuid)) {
@@ -84,7 +87,7 @@ class Hexapod(val uuid: UUID, val kind: String = "hexapod", val log: Logger = Lo
           new AtomicBoolean(t._2.health),
           new AtomicLong(t._2.lastActivity))
       })
-      Hexapod.hexapod(uuid).dispose()
+      Hexapod.hexapod(uuid).dispose(box)
     }
     Hexapod.hexapod(uuid) = box
     log.info("alive " + kind + " " + uuid)
@@ -109,7 +112,7 @@ class Hexapod(val uuid: UUID, val kind: String = "hexapod", val log: Logger = Lo
           new AtomicInteger(0), new AtomicBoolean(bot.history.exists(_ == Bot.Event.Connected)))
         log.debug("add entity bot " + value.bot.getClass.getName.split('.').last + " with target " + value.target + " for " + uuid)
         entity(bot) = value
-        publish(hexapod.Changed("add bot to entities ", uuid, kind, bot))
+        publish(HexapodChanged("add bot to entities ", uuid, kind, bot))
         if (entity(bot).authenticated == false)
           bot.authenticate(target)
       }
@@ -119,18 +122,22 @@ class Hexapod(val uuid: UUID, val kind: String = "hexapod", val log: Logger = Lo
         case _ => entity.get(bot).exists(_.authenticated == true)
       }
     }
-    def dispose() {
-      log.debug("dispose " + kind + " " + uuid)
-      import org.digimead.documentumelasticus.archinid.bot.Event
-      subscribers.foreach(t => t._1.removeSubscription(t._2.asInstanceOf[Subscriber[Event, t._1.Pub]]))
+    def bestEntity(): Option[BotEntity] = {
+      entity.values.filter(n => n.health == true && n.authenticated == true) match {
+        case Nil => None
+        case x => Some(x.maxBy(_.priority))
+      }
+    }
+    def dispose(replaceBy: Hexapod = null) {
+      Hexapod.publishFromCompanion(Hexapod.Event.Disposed(box, replaceBy))
+      subscribers.foreach(t => t._1.removeSubscription(t._2.asInstanceOf[Subscriber[BotEvent, t._1.Pub]]))
       removeSubscriptions()
       entity.clear()
       instance = null
     }
     private def subscribeBot(bot: Bot): Subscriber[_, _] = {
-      import org.digimead.documentumelasticus.archinid.bot.Event
-      val subscriber = new Subscriber[Event, bot.Pub] {
-        def notify(pub: bot.Pub, event: Event): Unit = {
+      val subscriber = new Subscriber[BotEvent, bot.Pub] {
+        def notify(pub: bot.Pub, event: BotEvent): Unit = {
           event match {
             case Bot.Event.SendMessage(_, _) =>
               entity(bot).health = true
@@ -152,7 +159,7 @@ class Hexapod(val uuid: UUID, val kind: String = "hexapod", val log: Logger = Lo
       subscriber
     }
   }
-  case class BotEntity(publish: hexapod.Changed => Unit)(
+  case class BotEntity(publish: HexapodChanged => Unit)(
     val bot: Bot,
     val target: String,
     val subscriber: Subscriber[_, _],
@@ -162,15 +169,15 @@ class Hexapod(val uuid: UUID, val kind: String = "hexapod", val log: Logger = Lo
     _health: AtomicBoolean = new AtomicBoolean(false),
     _lastActivity: AtomicLong = new AtomicLong(System.currentTimeMillis)) {
     def priority = _priority.get()
-    def priority_=(n: Int) { publish(hexapod.Changed("changed priority to " + n + " ", uuid, kind, bot)); _priority.set(n) }
+    def priority_=(n: Int) { publish(HexapodChanged("changed priority to " + n + " ", uuid, kind, bot)); _priority.set(n) }
     def authenticated = _authenticated.get()
-    def authenticated_=(n: Boolean) = if (n != _authenticated.get()) { publish(hexapod.Changed("changed authenticated to " + n + " ", uuid, kind, bot)); _authenticated.set(n) }
+    def authenticated_=(n: Boolean) = if (n != _authenticated.get()) { publish(HexapodChanged("changed authenticated to " + n + " ", uuid, kind, bot)); _authenticated.set(n) }
     def authenticationAttempt = _authenticationAttempt.get()
-    def authenticationAttempt_=(n: Int) = if (n != _authenticationAttempt.get()) { publish(hexapod.Changed("changed authenticationAttempt to " + n + " ", uuid, kind, bot)); _authenticationAttempt.set(n) }
+    def authenticationAttempt_=(n: Int) = if (n != _authenticationAttempt.get()) { publish(HexapodChanged("changed authenticationAttempt to " + n + " ", uuid, kind, bot)); _authenticationAttempt.set(n) }
     def health = _health.get()
-    def health_=(n: Boolean) = if (n != _health.get()) { publish(hexapod.Changed("changed health to " + n + " ", uuid, kind, bot)); _health.set(n) }
+    def health_=(n: Boolean) = if (n != _health.get()) { publish(HexapodChanged("changed health to " + n + " ", uuid, kind, bot)); _health.set(n) }
     def lastActivity = _lastActivity.get()
-    def lastActivity_=(n: Long) = { publish(hexapod.Changed("changed lastActivity to " + n + " ", uuid, kind, bot)); _lastActivity.set(n) }
+    def lastActivity_=(n: Long) = { publish(HexapodChanged("changed lastActivity to " + n + " ", uuid, kind, bot)); _lastActivity.set(n) }
   }
 }
 
@@ -223,7 +230,11 @@ object Hexapod {
     if (config.getList("keyset") == None)
       return None
     try {
-      Some(KeySet(config.getList("keyset").mkString("")))
+      val key = config.getList("keyset").mkString("")
+      if (key.isEmpty)
+        None
+      else
+        Some(KeySet(key))
     } catch {
       case e =>
         log.warn(e.getMessage, e)
@@ -235,8 +246,8 @@ object Hexapod {
   /**
    * Singleton
    */
-  class ObjectH(val config: Config, val unlocked: KeySet[Unlocked], val keysetStorage: File) extends Publisher[hexapod.Event]
-    with SubscribeSelf[hexapod.Event] {
+  class ObjectH(val config: Config, val unlocked: KeySet[Unlocked], val keysetStorage: File) extends Publisher[HexapodEvent]
+    with SubscribeSelf[HexapodEvent] {
     val log = LoggerFactory.getLogger(classOf[Hexapod].getName)
     val uuid = config.uuid
     val hexapod = new HashMap[UUID, Hexapod] with SynchronizedMap[UUID, Hexapod]
@@ -292,17 +303,22 @@ object Hexapod {
         true
       }
     }
-    def notify(event: org.digimead.documentumelasticus.hexapod.Event) = event match {
+    def notify(event: HexapodEvent) = event match {
       case Event.New(hexapod) =>
         log.debug("new " + hexapod)
       case Event.Register(uuid, password) =>
         log.debug("register " + uuid)
         saveKeys()
+      case Event.Disposed(oldH, null) =>
+        log.debug("dispose " + oldH.uuid)
+      case Event.Disposed(oldH, newH) =>
+        log.debug("dispose and replace " + oldH.uuid)
     }
-    private[Hexapod] def publishFromCompanion(event: org.digimead.documentumelasticus.hexapod.Event) = publish(event)
+    private[Hexapod] def publishFromCompanion(event: HexapodEvent) = publish(event)
   }
   object Event {
-    case class New(val hexapod: Hexapod) extends hexapod.Event
-    case class Register(val uuid: UUID, val keyset: KeySet[Locked]) extends hexapod.Event
+    case class New(val hexapod: Hexapod) extends HexapodEvent
+    case class Register(val uuid: UUID, val keyset: KeySet[Locked]) extends HexapodEvent
+    case class Disposed(val oldHexapod: Hexapod, val newHexapod: Hexapod) extends HexapodEvent
   }
 }

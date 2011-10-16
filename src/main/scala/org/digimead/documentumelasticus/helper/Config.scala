@@ -45,8 +45,8 @@
  */
 
 package org.digimead.documentumelasticus.helper
-import java.io.BufferedWriter
 
+import java.io.BufferedWriter
 import java.io.File
 import java.io.FileWriter
 import java.util.UUID
@@ -54,7 +54,7 @@ import net.lag.configgy.Configgy
 import net.lag.configgy.{ Config => CConfig }
 import org.slf4j.LoggerFactory
 
-class Config(private val config: CConfig, private val file: File) {
+class Config(val config: CConfig, private val file: File) {
   private val log = LoggerFactory.getLogger(getClass.getName)
   def uuid = config.getString("uuid") match {
     case Some(uuid) => UUID.fromString(uuid)

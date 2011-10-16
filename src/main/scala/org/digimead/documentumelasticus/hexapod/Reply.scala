@@ -44,7 +44,7 @@
  *
  */
 
-package org.digimead.documentumelasticus.archinid
+package org.digimead.documentumelasticus.hexapod
 
 case class Reply(val botHash: Int,
   val blockHash: Int,

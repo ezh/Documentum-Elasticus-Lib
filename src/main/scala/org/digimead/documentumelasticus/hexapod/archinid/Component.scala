@@ -44,14 +44,10 @@
  *
  */
 
-package org.digimead.documentumelasticus.archinid
+package org.digimead.documentumelasticus.hexapod.archinid
 
 import java.io.{ BufferedInputStream, File, FileOutputStream }
 import java.nio.channels.Channels
-/*import org.apache.http
-commons.httpclient.{DefaultHttpMethodRetryHandler, HttpClient, HttpStatus}
-import org.apache.commons.httpclient.methods.GetMethod
-import org.apache.commons.httpclient.params.HttpMethodParams*/
 import org.slf4j.LoggerFactory
 
 class Component(val url: String,
@@ -64,7 +60,15 @@ class Component(val url: String,
   val description: String,
   val open_issues: Int,
   val versions: Map[String, Component.Version]) {
-  private val logger = LoggerFactory.getLogger(this.getClass)
+  private val log = LoggerFactory.getLogger(this.getClass)
+  def check(): Option[Boolean] = {
+    log.error("check")
+    None
+  }
+  def update(): Boolean = {
+    log.error("update")
+    false
+  }
   def download(path: File, version: String, force: Boolean = false): Boolean = {
     val timeout = 10
     /*    def httpGet(address: String, file: File): Boolean = {

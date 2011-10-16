@@ -48,11 +48,14 @@ package org.digimead.documentumelasticus.helper
 
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
+import scala.collection.mutable.ArrayStack
 import scala.collection.mutable.HashMap
 import scala.collection.mutable.HashSet
 import scala.collection.mutable.Subscriber
 import scala.collection.mutable.SynchronizedMap
+import scala.collection.mutable.SynchronizedQueue
 import scala.collection.mutable.SynchronizedSet
+import scala.collection.mutable.SynchronizedStack
 import scala.collection.mutable.{ Publisher => ScalaPublisher }
 
 trait SubscribeSelf[E] extends Publisher[E] {
@@ -76,18 +79,18 @@ trait Publisher[E] extends ScalaPublisher[E] {
   private val that = this
   private val waiter = new HashMap[PartialFunction[E, Unit], HashSet[AnyRef]] with SynchronizedMap[PartialFunction[E, Unit], HashSet[AnyRef]]
   private val waiterGuard = new HashSet[AnyRef] with SynchronizedSet[AnyRef]
-  val history = new HashSet[E] with SynchronizedSet[E]
+  val history = new SynchronizedQueue[E]
   // case class
-  private val historyRulesInstance = new HashMap[E, (HashSet[E]) => Unit] with SynchronizedMap[E, (HashSet[E]) => Unit]
+  private val historyRulesInstance = new HashMap[E, (SynchronizedQueue[E]) => Any] with SynchronizedMap[E, (SynchronizedQueue[E]) => Any]
   // classOf[case class]
-  private val historyRulesClass = new HashMap[Class[_ <: E], (HashSet[E]) => Unit] with SynchronizedMap[Class[_ <: E], (HashSet[E]) => Unit]
-  def addRule(e: E, block: (HashSet[E]) => Unit) = historyRulesInstance(e) = block
-  def addRule(e: Class[_ <: E], block: (HashSet[E]) => Unit) = historyRulesClass(e) = block
+  private val historyRulesClass = new HashMap[Class[_ <: E], (SynchronizedQueue[E]) => Any] with SynchronizedMap[Class[_ <: E], (SynchronizedQueue[E]) => Any]
+  def addRule(e: E, block: (SynchronizedQueue[E]) => Any) = historyRulesInstance(e) = block
+  def addRule(e: Class[_ <: E], block: (SynchronizedQueue[E]) => Any) = historyRulesClass(e) = block
   /*
    * clear
    */
   def clearEvent(event: E): Unit = clearEvent(Seq(event))
-  def clearEvent(event: Seq[E]): Unit = event.foreach(e => history.removeEntry(e))
+  def clearEvent(event: Seq[E]): Unit = history.dequeueAll(e => event.exists(_ == e))
   def clearEvent(): Unit = history.clear()
   /*
    * wait()
@@ -164,7 +167,7 @@ trait Publisher[E] extends ScalaPublisher[E] {
   private def getWaiter(eventMatcher: PartialFunction[E, Unit]) = waiter.getOrElse(eventMatcher, new HashSet[AnyRef] with SynchronizedSet[AnyRef])
   override protected def publish(event: E) {
     log.trace("publish " + event)
-    history(event) = true
+    history += event
     if (historyRulesInstance.isDefinedAt(event))
       historyRulesInstance(event)(history)
     if (historyRulesClass.isDefinedAt(event.getClass()))

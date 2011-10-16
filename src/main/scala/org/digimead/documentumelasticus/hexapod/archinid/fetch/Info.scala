@@ -44,32 +44,31 @@
  *
  */
 
-package org.digimead.documentumelasticus.archinid.fetch
+package org.digimead.documentumelasticus.hexapod.archinid.fetch
+import de.javawi.jstun.util.Address
 
-import java.util.concurrent.Executors
+import java.util.UUID
 import java.util.concurrent.ScheduledExecutorService
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
-import net.sf.ehcache.CacheManager
-import net.sf.ehcache.Element
+import java.util.concurrent.{ Executors, TimeUnit }
+import net.lag.configgy.Config
+import net.sf.ehcache.{ CacheManager, Element }
 import org.apache.http.client.ResponseHandler
 import org.apache.http.client.methods.HttpGet
-import org.apache.http.impl.client.BasicResponseHandler
-import org.apache.http.impl.client.DefaultHttpClient
-import org.digimead.documentumelasticus.archinid.Component
-import org.digimead.documentumelasticus.archinid.Component
-import org.digimead.documentumelasticus.helper.Config
+import org.apache.http.impl.client.{ BasicResponseHandler, DefaultHttpClient }
+import org.digimead.documentumelasticus.hexapod.Hexapod
+import org.digimead.documentumelasticus.hexapod.PoolEvent
+import org.digimead.documentumelasticus.hexapod.PoolSingleton
+import org.digimead.documentumelasticus.hexapod.bot.irc.IRCEntity
+import org.digimead.documentumelasticus.hexapod.bot.jabber.JabberEntity
+import org.digimead.documentumelasticus.hexapod.{ Info => HInfo, InfoAkka, InfoIRC, InfoJabber }
 import org.slf4j.LoggerFactory
 import scala.actors.Actor
 import scala.collection.mutable.Subscriber
-import scala.util.parsing.json._
-import java.net.URLEncoder._
 
-private class Components(val config: Config, timeout: Long) extends Actor {
+private class Info(config: Config, Pool: PoolSingleton, timeout: Long) extends Actor {
   private val log = LoggerFactory.getLogger(getClass.getName)
-  private val BASE_URI = "http://github.com/api/v2/json";
-  start()
-  log.trace("alive")
+  private var ip = new AtomicReference[String](null)
   private lazy val manager = {
     if (config.getString("cache") == None) {
       val manager = new CacheManager()
@@ -89,6 +88,16 @@ private class Components(val config: Config, timeout: Long) extends Actor {
   }
   private lazy val cacheNames = manager.getCacheNames()
   private lazy val cache = manager.getCache(cacheNames.head)
+  start()
+  log.trace("alive")
+  def getIP(): String = {
+    var result = ip.get()
+    while (result == null) {
+      Thread.sleep(100)
+      result = ip.get()
+    }
+    result
+  }
   def act() {
     loop {
       react {
@@ -97,103 +106,109 @@ private class Components(val config: Config, timeout: Long) extends Actor {
     }
   }
   private def fetch() = synchronized {
-    log.trace("fetch components")
-    // get components
-    val anchor = BASE_URI + "/repos/show/ezh"
+    log.trace("fetch info")
+    ip.set(fetchIP())
+    Info.info.set(fetchSelf())
+  }
+  private def fetchIP(): String = {
+    log.trace("fetch ip")
+    val anchor = "http://www.myip.ru/get_ip.php"
     val element = cache.get(anchor)
     if (element != null) {
       log.trace("get cached " + anchor)
-      Components.components.set(element.getValue.asInstanceOf[Seq[Component]])
+      element.getValue.asInstanceOf[String]
     } else {
       log.trace("get " + anchor)
       val client = new DefaultHttpClient()
-      val handler: ResponseHandler[String] = new BasicResponseHandler()
-      try {
+      val response: String = try {
         val method = new HttpGet(anchor)
-        val components: Seq[Component] = JSON.parseFull(client.execute[String](method, handler)) match {
-          case Some(json) =>
-            json.asInstanceOf[Map[String, List[Map[String, Any]]]]("repositories").filter(r => r("name").
-              asInstanceOf[String].startsWith("Documentum-Elasticus-")).map(r => {
-              val anchor = BASE_URI + "/repos/show/ezh/" + r("name").asInstanceOf[String] + "/tags"
-              val method = new HttpGet(anchor)
-              val details = JSON.parseFull(client.execute[String](method, handler)).map(json => json.asInstanceOf[Map[String, Map[String, Any]]]("tags")).getOrElse(Map[String, Any]())
-              new Component(
-                r("url").asInstanceOf[String],
-                r("homepage").asInstanceOf[String],
-                r("watchers").asInstanceOf[Double].toInt,
-                r("created_at").asInstanceOf[String],
-                r("pushed_at").asInstanceOf[String],
-                r("forks").asInstanceOf[Double].toInt,
-                r("name").asInstanceOf[String],
-                r("description").asInstanceOf[String],
-                r("open_issues").asInstanceOf[Double].toInt,
-                details.map(tag => {
-                  val name = tag._1.asInstanceOf[String]
-                  val hash = tag._2.asInstanceOf[String]
-                  val base = "https://github.com/ezh/" + r("name").asInstanceOf[String] + "/tree/" + encode(name, "US-ASCII") + "/dist/"
-                  val anchor = BASE_URI + "/blob/all/ezh/" + r("name").asInstanceOf[String] + "/" + encode(name, "US-ASCII")
-                  val method = new HttpGet(anchor)
-                  val blobs = JSON.parseFull(client.execute[String](method, handler)).map(json => json.asInstanceOf[Map[String, Map[String, Any]]]("blobs")).getOrElse(Map[String, Any]())
-                  val files = blobs.filter(blob => blob._1.startsWith("dist/")).map(blob => {
-                    blob._1.substring(5) -> ("""http://github.com/ezh/""" + encode(r("name").asInstanceOf[String], "US-ASCII") +
-                      "/blob/" + encode(tag._1, "US-ASCII") +
-                      "/" + encode(blob._1, "US-ASCII") + "?raw=true")
-                  })
-                  name.asInstanceOf[String] -> Component.Version(hash, base, files)
-                }))
-            })
-          case None => Seq()
+        val handler: ResponseHandler[String] = new BasicResponseHandler()
+        val content = client.execute[String](method, handler)
+        val ipRegExp = """<TR><TD bgcolor=white align=center valign=middle>(\d+\.\d+\.\d+\.\d+)</TD></TR>""".r
+        if (content.indexOf("""<TR><TD bgcolor=white align=center valign=middle>""") > 0)
+          ipRegExp.findFirstMatchIn(content).map(_.group(1)).getOrElse("")
+        else {
+          log.error("broken content: " + content)
+          ""
         }
-        cache.put(new Element(anchor, components))
-        Components.components.set(components)
       } catch {
         case e =>
-          log.error(e.getMessage(), e)
-          Seq()
+          log.error(e.getMessage, e)
+          ""
       } finally {
         client.getConnectionManager.shutdown
       }
+      // result
+      if (response == "") {
+        log.error("fetch ip failed")
+        null
+      } else {
+        cache.put(new Element(anchor, response))
+        response
+      }
     }
+  }
+  private def fetchSelf(): HInfo = {
+    val irc: Seq[InfoIRC] = Pool.entities("irc").map(bot => {
+      val pircbot = bot._2.asInstanceOf[IRCEntity].pircbot
+      InfoIRC(pircbot.nick, pircbot.uri, pircbot.getChannels.toSeq)
+    }).toSeq
+    val jabber: Seq[InfoJabber] = Pool.entities("jabber").map(bot => {
+      val smack = bot._2.asInstanceOf[JabberEntity].smack
+      InfoJabber(smack.nick, smack.options.getHost)
+    }).toSeq
+    val akka: Seq[InfoAkka] = Seq()
+    HInfo(
+      UUID.fromString(config.getString("uuid").get),
+      new Address(getIP()),
+      Hexapod.config.getInt("consolePort", -1),
+      irc,
+      jabber,
+      akka)
   }
   case object Fetch
 }
 
-object Components {
+object Info {
   private val log = LoggerFactory.getLogger(getClass.getName)
-  private var components = new AtomicReference[Seq[Component]](Seq())
-  private var instance: Components = null
+  private val info = new AtomicReference[HInfo](null)
+  private var instance: Info = null
   private var scheduler: ScheduledExecutorService = null
+  private var unsubscribe: () => Unit = null
   private val defaultTimeout = 60 * 60 * 1000
-  def run(config: Config, timeout: Long = defaultTimeout) = synchronized {
-    import org.digimead.documentumelasticus.archinid.pool
+  def run(config: Config, Pool: PoolSingleton, timeout: Long = defaultTimeout) = synchronized {
     log.trace("start service")
-    assert(instance == null && scheduler == null)
-    instance = new Components(config, timeout)
+    assert(instance == null && scheduler == null && unsubscribe == null)
+    instance = new Info(config, Pool, timeout)
     scheduler = Executors.newSingleThreadScheduledExecutor()
     val runnable = new Runnable { def run = instance ! instance.Fetch }
     scheduler.scheduleAtFixedRate(runnable, 0, timeout, TimeUnit.MILLISECONDS)
+    val subscriber = new Subscriber[PoolEvent, Pool.Pub] {
+      def notify(pub: Pool.Pub, event: PoolEvent): Unit = {
+        event match {
+          case Pool.Event.Changed(bot, event) => instance ! instance.Fetch
+          case _ =>
+        }
+      }
+    }
+    Pool.subscribe(subscriber.asInstanceOf[Pool.Sub])
+    unsubscribe = () => { Pool.removeSubscription(subscriber) }
   }
   def dispose() = synchronized {
     log.trace("stop service")
-    assert(instance != null && scheduler != null)
+    assert(instance != null && scheduler != null && unsubscribe != null)
     scheduler.shutdownNow()
+    unsubscribe()
     instance = null
     scheduler = null
+    unsubscribe = null
   }
-  def get(group: String): Seq[Component] = {
-    var result = components.get()
+  def get(): HInfo = {
+    var result = info.get()
     while (result == null) {
       Thread.sleep(100)
-      result = components.get()
+      result = info.get()
     }
-    group.toUpperCase match {
-      case "ALL" => result
-      case "STANDARD" =>
-        val filter = instance.config.getList("components.standardFilter")
-        result.filter(c => filter.contains(c.name))
-      case _ =>
-        log.warn("unknown components group " + group)
-        Seq()
-    }
+    result
   }
 }

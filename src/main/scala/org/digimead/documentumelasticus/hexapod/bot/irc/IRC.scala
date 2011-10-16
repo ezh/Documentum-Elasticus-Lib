@@ -44,26 +44,27 @@
  *
  */
 
-package org.digimead.documentumelasticus.archinid.bot
+package org.digimead.documentumelasticus.hexapod.bot.irc
 
 import java.util.UUID
-import java.util.concurrent.atomic.{ AtomicInteger, AtomicLong }
+import java.util.concurrent.atomic.{ AtomicInteger, AtomicLong, AtomicReference }
 import java.util.zip.CRC32
-import net.lag.configgy.Config
-import org.digimead.documentumelasticus.Hexapod
-import org.digimead.documentumelasticus.archinid.{ Bot, ProcessSingleton, Reply, Request }
 import org.digimead.documentumelasticus.helper.SubscribeSelf
+import org.digimead.documentumelasticus.hexapod.Hexapod
+import org.digimead.documentumelasticus.hexapod.ProcessSingleton
+import org.digimead.documentumelasticus.hexapod.Reply
+import org.digimead.documentumelasticus.hexapod.Request
+import org.digimead.documentumelasticus.hexapod.bot.Bot
+import org.digimead.documentumelasticus.hexapod.bot.BotEvent
 import org.jibble.pircbot.{ PircBot, User }
-import org.slf4j.Logger
+import org.slf4j.{ Logger, LoggerFactory }
 import scala.actors.{ Actor, OutputChannel }
 import scala.actors.Futures._
-import scala.collection.mutable.{ HashMap, Publisher, Subscriber, SynchronizedMap }
+import scala.collection.mutable.{ HashMap, HashSet, Publisher, Subscriber, SynchronizedMap, SynchronizedSet }
 
-package irc {
-  sealed trait Event
-  sealed trait Message
-  sealed trait MessageType
-}
+sealed trait IRCEvent
+sealed trait IRCMessage
+sealed trait IRCMessageType
 
 trait IRCEntity extends Bot {
   private val that = this
@@ -75,6 +76,8 @@ trait IRCEntity extends Bot {
   val timeout = 60000 // 60s timeout for any reaction; very slow transport
   val lock = new java.util.concurrent.locks.ReentrantLock
   var incompleteBlockBuffer = new HashMap[IncompleteBlockKey, Seq[IncompleteBlockValue]] with SynchronizedMap[IncompleteBlockKey, Seq[IncompleteBlockValue]]
+  val skipUserMessage = new HashSet[String] with SynchronizedSet[String]
+  config.getList("irc.server." + server + ".skip_user").foreach(skipUserMessage(_) = true)
   start()
   def act() {
     loop {
@@ -88,9 +91,10 @@ trait IRCEntity extends Bot {
         case Bot.Message.Heartbeat =>
           try { heartbeat() } catch { case e => log.error(e.getMessage, e) }
         case IRC.Message.RegisterPassword(password) =>
-        //log.trace("set password for account")
-        //sendMessage("NickServ", "register " + password + " " + uuid.toString + "@digimead.org")
-        //reply(getMessage("NickServ"))
+          log.trace("set password for account")
+          send("NickServ", "register " + password + " " + uuid.toString + "@digimead.org")
+          val s = sender
+          future { s ! getMessage("NickServ", timeout, timeout / 5, config.getList("irc.server." + server + ".nickserv_msg")) }
         case request: Request =>
           try {
             command(request.target, request.t.message, request.force.get)
@@ -106,14 +110,14 @@ trait IRCEntity extends Bot {
       }
     }
   }
-  override def notify(event: Event) = {
+  override def notify(event: BotEvent) = {
     super.notify(event)
     event match {
-      case Bot.Event.Other(v @ value) if v.isInstanceOf[irc.Event] =>
-        v.asInstanceOf[irc.Event] match {
+      case Bot.Event.Other(v @ value) if v.isInstanceOf[IRCEvent] =>
+        v.asInstanceOf[IRCEvent] match {
           case that.IRC.Event.Join(target, channel) =>
-            if (target == pircbot.nick && !history(Bot.Event.Connected) &&
-              pircbot.joinCounter.get == config.getList("archinid.irc.server." + server + ".channels").size)
+            if (target == pircbot.nick && !history.exists(_ == Bot.Event.Connected) &&
+              pircbot.joinCounter.get == config.getList("irc.server." + server + ".channels").size)
               publish(Bot.Event.Connected)
             if (target != pircbot.nick)
               publish(Bot.Event.UserEnter(target))
@@ -138,7 +142,7 @@ trait IRCEntity extends Bot {
     clearEvent()
     publish(Bot.Event.Connecting(System.currentTimeMillis))
     pircbot.prepare(nick(), uri())
-    val serverChannels = config.getList("archinid.irc.server." + server + ".channels")
+    val serverChannels = config.getList("irc.server." + server + ".channels")
     if (serverChannels.isEmpty) {
       log.warn("key archinid.irc.server." + server + ".channels not found in configuration file")
       publish(Bot.Event.Disconnected)
@@ -167,7 +171,7 @@ trait IRCEntity extends Bot {
       if (pircbot.isConnected) {
         future { serverChannels.par.foreach(pircbot.joinChannel(_)) }
         waitEvent(Bot.Event.Connected, timeout, true)
-        if (!history(Bot.Event.Connected)) {
+        if (!history.exists(_ == Bot.Event.Connected)) {
           log.warn("connection failed")
           disconnect()
         } else {
@@ -196,7 +200,7 @@ trait IRCEntity extends Bot {
       future { pircbot.disconnect() }
       waitEvent(Bot.Event.Disconnected, timeout, true)
     }
-    if (!history(Bot.Event.Disconnected))
+    if (!history.exists(_ == Bot.Event.Disconnected))
       publish(Bot.Event.Disconnected)
   }
   def dispose() {
@@ -206,7 +210,7 @@ trait IRCEntity extends Bot {
   private def heartbeat(): Unit = lock.synchronized {
     if (lock.tryLock()) {
       try {
-        val serverChannels = config.getList("archinid.irc.server." + server + ".channels")
+        val serverChannels = config.getList("irc.server." + server + ".channels")
         if (pircbot.nick != "" && pircbot.uri != "" &&
           (!pircbot.isConnected() || serverChannels.size != pircbot.getChannels().size)) {
           val lastConnecting = history.find(_.isInstanceOf[Bot.Event.Connecting]).getOrElse(Bot.Event.Connecting(0)).asInstanceOf[Bot.Event.Connecting]
@@ -258,11 +262,11 @@ trait IRCEntity extends Bot {
   }
   private def processMessage(sender: String, login: String, hostname: String, message: String) {
     try {
-      if (!processIncommingMessage.get()) {
-        processIncommingMessage.set(true)
+      if (skipIncommingMessage.get()) {
+        skipIncommingMessage.set(false)
         return
       }
-      if (sender == pircbot.nick)
+      if (skipUserMessage(sender))
         return
       if (login == "")
         return
@@ -282,7 +286,7 @@ trait IRCEntity extends Bot {
           val id = message.drop(5).dropRight(42).split("#")
           val hash = (id(0)).toInt + sender.hashCode
           val (blockN, blocksTotal) = id(1).split("/").map(_.toInt).toSeq match { case x => (x.head, x.last) }
-          log.debug("[BLOCK] receive pong " + blockN + "/" + blocksTotal + " with hash " + hash)
+          log.info("[BLOCK] receive pong " + blockN + "/" + blocksTotal + " with hash " + hash)
           Hexapod(this, sender).foreach(_.entity(this).health = true)
           Request ! Reply(this.hashCode, hash, blockN, blocksTotal, "pong")
         case message if (message.startsWith("--- [") && message.endsWith("] begin of message block ---")) =>
@@ -299,7 +303,7 @@ trait IRCEntity extends Bot {
           val blockHash = blocks.head.hash
           val blockN = blocks.head.count
           val blocksTotal = blocks.head.total
-          log.debug("[BLOCK] receive block " + blockN + "/" + blocksTotal + " with hash " + blockHash)
+          log.info("[BLOCK] receive block " + blockN + "/" + blocksTotal + " with hash " + blockHash)
           val blockText = blocks.drop(1).map(_.chunk).mkString("\n").trim
           incompleteBlockBuffer.remove(key)
           Request ! Reply(this.hashCode, blockHash, blockN, blocksTotal, blockText)
@@ -337,19 +341,18 @@ trait IRCEntity extends Bot {
       case e => log.warn(e.getMessage(), e)
     }
   }
-  /*
-  private def getMessage(target: String, timeoutBefore: Int = timeout, timeoutAfter: Int = timeout / 5): Option[String] = {
+  private def getMessage(target: String, timeoutBefore: Int = timeout, timeoutAfter: Int = timeout / 5, template: Seq[String] = Seq()): Option[String] = {
     var result: Option[String] = None
     def getMessageChunk(target: String, timeout: Int): Option[String] = {
       val message: AtomicReference[String] = new AtomicReference(null)
-      val receiver = new Subscriber[Event, Pub] {
-        def notify(pub: Pub, event: Event): Unit = {
+      val receiver = new Subscriber[BotEvent, Pub] {
+        def notify(pub: Pub, event: BotEvent): Unit = {
           event match {
-            case event: Bot.Event.Message =>
-              val msg = event.message.asInstanceOf[IRC.Event.Message]
-              if (msg.sender == target) {
+            case event: Bot.Event.ReceiveMessage =>
+              if (event.target == target) {
                 message.synchronized {
-                  message.set(msg.message)
+                  skipIncommingMessage.set(true)
+                  message.set(event.message)
                   message.notifyAll
                 }
               }
@@ -375,15 +378,76 @@ trait IRCEntity extends Bot {
       chunk = getMessageChunk(target, timeout)
       result = Some(result.getOrElse("") + chunk.getOrElse(""))
       timeout = timeoutAfter
-    } while (chunk != None)
+    } while (chunk != None && !template.exists(chunk.get.trim.matches(_)))
     log.trace("got message from " + target)
     result
-    }*/
-  private def nick() = getNickByUUID(uuid)
-  private def uri() = config.getString("archinid.irc.server." + server + ".uri").getOrElse("")
+  }
+  private def nick() = IRC.getNickByUUID(uuid, role)
+  private def uri() = config.getString("irc.server." + server + ".uri").getOrElse("")
   private def role() = config.getString("role").getOrElse("client")
-  private def getNickByUUID(arg: String): String = getNickByUUID(UUID.fromString(arg))
-  private def getNickByUUID(arg: UUID): String = {
+  protected case class IncompleteBlockKey(val sender: String, val login: String, val hostname: String)
+  protected case class IncompleteBlockValue(val hash: Int, val count: Int, val total: Int, val chunk: String, val timestamp: Long)
+  class Bot(val log: Logger) extends PircBot {
+    assert(log != null)
+    private object Stash {
+      var nick: String = ""
+      var uri: String = ""
+    }
+    val joinCounter = new AtomicInteger(0)
+    def nick = Stash.nick
+    def uri = Stash.uri
+    def prepare(nick: String, uri: String) {
+      if (!Stash.nick.isEmpty)
+        skipUserMessage(Stash.nick) = false
+      skipUserMessage(nick) = true
+      Stash.nick = nick
+      Stash.uri = uri
+      setName(nick)
+    }
+    protected override def onConnect() = {
+      joinCounter.set(0)
+      that.publish(Bot.Event.Other(that.IRC.Event.Connected))
+    }
+    protected override def onDisconnect() = that.publish(Bot.Event.Disconnected)
+    protected override def onJoin(channel: String, sender: String, login: String, hostname: String) = {
+      if (sender == nick)
+        joinCounter.incrementAndGet()
+      that.publish(Bot.Event.Other(that.IRC.Event.Join(sender, channel)))
+    }
+    protected override def onQuit(sender: String, login: String, hostname: String, reason: String) =
+      that.publish(Bot.Event.Other(that.IRC.Event.Quit(sender, reason)))
+    protected override def onUserList(channel: String, users: Array[User]) =
+      that.publish(Bot.Event.Other(that.IRC.Event.UserList(channel, users)))
+    protected override def onAction(sender: String, login: String, hostname: String, target: String, action: String) =
+      log.trace("[ACTION] from " + target + " " + action)
+    protected override def onMessage(channel: String, sender: String, login: String, hostname: String, message: String) =
+      that ! IRC.Message.Receive(sender, login, hostname, message, that.IRC.Type.Message)
+    protected override def onPrivateMessage(sender: String, login: String, hostname: String, message: String) =
+      that ! IRC.Message.Receive(sender, login, hostname, message, that.IRC.Type.Private)
+    protected override def onNotice(sender: String, login: String, hostname: String, target: String, message: String) =
+      that ! IRC.Message.Receive(sender, login, hostname, message, that.IRC.Type.Notice)
+  }
+}
+
+trait IRCSingleton {
+  val log = LoggerFactory.getLogger(getClass.getName)
+  object Message {
+    case class RegisterPassword(val newPassword: String) extends IRCMessage
+    case class Receive(val sender: String, val login: String, val hostname: String, val message: String, val messageType: IRCMessageType) extends IRCMessage
+  }
+  object Event {
+    case object Connected extends IRCEvent
+    case class Join(val target: String, val channel: String) extends IRCEvent
+    case class Quit(val target: String, val reason: String) extends IRCEvent
+    case class UserList(val channel: String, users: Array[User]) extends IRCEvent
+  }
+  object Type {
+    case object Message extends IRCMessageType
+    case object Private extends IRCMessageType
+    case object Notice extends IRCMessageType
+  }
+  def getNickByUUID(arg: String, role: String): String = getNickByUUID(UUID.fromString(arg), role)
+  def getNickByUUID(arg: UUID, role: String): String = {
     val prefix = role match {
       case "client" => "_DC_"
       case "archinid" => "_DA_"
@@ -431,63 +495,6 @@ trait IRCEntity extends Bot {
       (arg >> 16).toByte,
       (arg >> 8).toByte,
       arg.toByte), 8))
-  }
-  protected case class IncompleteBlockKey(val sender: String, val login: String, val hostname: String)
-  protected case class IncompleteBlockValue(val hash: Int, val count: Int, val total: Int, val chunk: String, val timestamp: Long)
-  class Bot(val log: Logger) extends PircBot {
-    assert(log != null)
-    private object Stash {
-      var nick: String = ""
-      var uri: String = ""
-    }
-    val joinCounter = new AtomicInteger(0)
-    def nick = Stash.nick
-    def uri = Stash.uri
-    def prepare(nick: String, uri: String) {
-      Stash.nick = nick
-      Stash.uri = uri
-      setName(nick)
-    }
-    protected override def onConnect() = {
-      joinCounter.set(0)
-      that.publish(Bot.Event.Other(that.IRC.Event.Connected))
-    }
-    protected override def onDisconnect() = that.publish(Bot.Event.Disconnected)
-    protected override def onJoin(channel: String, sender: String, login: String, hostname: String) = {
-      if (sender == nick)
-        joinCounter.incrementAndGet()
-      that.publish(Bot.Event.Other(that.IRC.Event.Join(sender, channel)))
-    }
-    protected override def onQuit(sender: String, login: String, hostname: String, reason: String) =
-      that.publish(Bot.Event.Other(that.IRC.Event.Quit(sender, reason)))
-    protected override def onUserList(channel: String, users: Array[User]) =
-      that.publish(Bot.Event.Other(that.IRC.Event.UserList(channel, users)))
-    protected override def onAction(sender: String, login: String, hostname: String, target: String, action: String) =
-      log.trace("[ACTION] from " + target + " " + action)
-    protected override def onMessage(channel: String, sender: String, login: String, hostname: String, message: String) =
-      that ! IRC.Message.Receive(sender, login, hostname, message, that.IRC.Type.Message)
-    protected override def onPrivateMessage(sender: String, login: String, hostname: String, message: String) =
-      that ! IRC.Message.Receive(sender, login, hostname, message, that.IRC.Type.Private)
-    protected override def onNotice(sender: String, login: String, hostname: String, target: String, message: String) =
-      that ! IRC.Message.Receive(sender, login, hostname, message, that.IRC.Type.Notice)
-  }
-}
-
-trait IRCSingleton {
-  object Message {
-    case class RegisterPassword(val newPassword: String) extends irc.Message
-    case class Receive(val sender: String, val login: String, val hostname: String, val message: String, val messageType: irc.MessageType) extends irc.Message
-  }
-  object Event {
-    case object Connected extends irc.Event
-    case class Join(val target: String, val channel: String) extends irc.Event
-    case class Quit(val target: String, val reason: String) extends irc.Event
-    case class UserList(val channel: String, users: Array[User]) extends irc.Event
-  }
-  object Type {
-    case object Message extends irc.MessageType
-    case object Private extends irc.MessageType
-    case object Notice extends irc.MessageType
   }
 }
 

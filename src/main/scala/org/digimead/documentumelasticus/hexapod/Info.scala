@@ -34,7 +34,8 @@
  *
  */
 
-package org.digimead.documentumelasticus.archinid
+package org.digimead.documentumelasticus.hexapod
+import de.javawi.jstun.util.Address
 
 import java.util.UUID
 
@@ -55,7 +56,8 @@ case class InfoAkka(
 
 case class Info(
   uuid: UUID,
-  ip: String,
+  publicIP: Address,
+  consolePort: Int,
   irc: Seq[InfoIRC],
   jabber: Seq[InfoJabber],
   akka: Seq[InfoAkka]

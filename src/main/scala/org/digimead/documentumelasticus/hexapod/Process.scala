@@ -44,33 +44,32 @@
  *
  */
 
-package org.digimead.documentumelasticus.archinid
+package org.digimead.documentumelasticus.hexapod
 
 import java.net.InetAddress
 import java.util.Date
-import org.digimead.documentumelasticus.Hexapod
-import org.digimead.documentumelasticus.archinid.fetch.{ Info => FInfo }
+import org.digimead.documentumelasticus.hexapod.archinid.fetch.{ Info => FInfo }
 import org.digimead.documentumelasticus.helper.Publisher
+import org.digimead.documentumelasticus.helper.Publisher
+import org.digimead.documentumelasticus.hexapod.bot.Bot
 import scala.actors.Actor
 import scala.util.matching.Regex
 import sun.management.ManagementFactory
 
-package process {
-  trait Message
-  trait Event
-  case class Command(
-    val command: String,
-    val args: Seq[String],
-    val sender: Option[Hexapod],
-    val hash: Int,
-    val source: Source)
-  case class Source(
-    val bot: Bot,
-    val target: String)
-}
+trait ProcessMessage
+trait ProcessEvent
+case class Command(
+  val command: String,
+  val args: Seq[String],
+  val sender: Option[Hexapod],
+  val hash: Int,
+  val source: Source)
+case class Source(
+  val bot: Bot,
+  val target: String)
 
-trait ProcessSingleton extends Publisher[process.Event] with Actor {
-  type CommadsDispatcher = PartialFunction[process.Command, Option[String]]
+trait ProcessSingleton extends Publisher[ProcessEvent] with Actor {
+  type CommadsDispatcher = PartialFunction[Command, Option[String]]
   val commandsDispatcher: CommadsDispatcher
   start()
   def act {
@@ -86,13 +85,13 @@ trait ProcessSingleton extends Publisher[process.Event] with Actor {
   def checkCommand(command: Message.Command): Boolean = {
     true
   }
-  def command(f: PartialFunction[process.Command, Option[String]], cmd: Message.Command): Unit = {
+  def command(f: PartialFunction[Command, Option[String]], cmd: Message.Command): Unit = {
     if (checkCommand(cmd)) {
       val args = cmd.buffer.split(" ").map(_.trim)
-      cmd.bot.log.info("process command " + args.head.toLowerCase() + " from " + cmd.target)
-      val source = process.Source(cmd.bot, cmd.target)
+      cmd.bot.log.info("command <= " + cmd.target + ": " + args.head.toLowerCase())
+      val source = Source(cmd.bot, cmd.target)
       implicit val hash = cmd.buffer.trim.hashCode()
-      val command = process.Command(args.head.toLowerCase(), args.tail, cmd.sender, hash, source)
+      val command = Command(args.head.toLowerCase(), args.tail, cmd.sender, hash, source)
       if (f.isDefinedAt(command)) {
         publish(Event.Process(cmd))
         val fResult = try {
@@ -139,7 +138,7 @@ trait ProcessSingleton extends Publisher[process.Event] with Actor {
     val startTime = new Date(mx.getStartTime())
     val uptime = mx.getUptime()
     val info = FInfo.get()
-    response = info.uuid + " at " + info.ip + " host " + InetAddress.getLocalHost().getHostName() + "\n"
+    response = info.uuid + " at " + info.publicIP + ":" + Hexapod.config.getInt("consolePort", -1) + " host " + InetAddress.getLocalHost().getHostName() + "\n"
     response += "start at " + startTime + "\n"
     response += "uptime " + (uptime / 100000).floor + " min\n"
     info.irc.foreach(irc => {
@@ -153,9 +152,9 @@ trait ProcessSingleton extends Publisher[process.Event] with Actor {
     response
   }
   object Message {
-    case class Command(bot: Bot, target: String, sender: Option[Hexapod], buffer: String) extends process.Message
+    case class Command(bot: Bot, target: String, sender: Option[Hexapod], buffer: String) extends ProcessMessage
   }
   object Event {
-    case class Process(command: Message.Command) extends process.Event
+    case class Process(command: Message.Command) extends ProcessEvent
   }
 }

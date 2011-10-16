@@ -44,28 +44,32 @@
  *
  */
 
-package org.digimead.documentumelasticus.archinid
+package org.digimead.documentumelasticus.hexapod.bot
 
 import java.security.SecureRandom
 import java.util.UUID
-import java.util.concurrent.atomic.{ AtomicBoolean, AtomicInteger }
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.ReentrantLock
 import javax.crypto.Cipher
-import net.lag.configgy.Config
-import org.digimead.documentumelasticus.{ Archinid, Hexapod }
-import org.digimead.documentumelasticus.helper.{ OpenPGP, Passwords, Publisher, SubscribeSelf }
+import org.digimead.documentumelasticus.helper.Config
+import org.digimead.documentumelasticus.helper.Passwords
+import org.digimead.documentumelasticus.helper.Publisher
+import org.digimead.documentumelasticus.helper.SubscribeSelf
 import org.digimead.documentumelasticus.helper.openpgp.AsymmetricAlgorithm
+import org.digimead.documentumelasticus.helper.openpgp.OpenPGP
+import org.digimead.documentumelasticus.hexapod.Hexapod
+import org.digimead.documentumelasticus.hexapod.PoolSingleton
+import org.digimead.documentumelasticus.hexapod.Request
 import org.slf4j.MDC
 import scala.actors.Actor
 import scala.actors.Futures.future
+import scala.collection.mutable.SynchronizedQueue
 import scala.collection.mutable.{ HashMap, HashSet, SynchronizedMap }
 
-package bot {
-  sealed trait Event
-  sealed trait Message
-}
+sealed trait BotEvent
+sealed trait BotMessage
 
-trait Bot extends Actor with Publisher[bot.Event] with SubscribeSelf[bot.Event] {
+trait Bot extends Actor with Publisher[BotEvent] with SubscribeSelf[BotEvent] {
   val uuid: UUID
   val Pool: PoolSingleton
   val server: String
@@ -74,26 +78,27 @@ trait Bot extends Actor with Publisher[bot.Event] with SubscribeSelf[bot.Event] 
   val kind: String
   val reconnectFlag = new AtomicBoolean(true)
   val priority: Int // higher better
-  val processIncommingMessage = new AtomicBoolean(true)
+  val skipIncommingMessage = new AtomicBoolean(false)
+  val skipUserMessage: HashSet[String]
   val lastBlockedCommand = new HashMap[String, String] with SynchronizedMap[String, String]
   val targetUUIDMap = new HashMap[String, UUID] with SynchronizedMap[String, UUID]
   private val authenticationLock = new HashMap[String, ReentrantLock] with SynchronizedMap[String, ReentrantLock]
-  addRule(classOf[Bot.Event.Connecting], (history: HashSet[bot.Event]) => {
-    history(Bot.Event.Connected) = false
-    history(Bot.Event.Disconnected) = false
+  addRule(classOf[Bot.Event.Connecting], (history: SynchronizedQueue[BotEvent]) => {
+    history.dequeueAll(_ == Bot.Event.Connected)
+    history.dequeueAll(_ == Bot.Event.Disconnected)
   })
-  addRule(Bot.Event.Connected, (history: HashSet[bot.Event]) => {
-    history.filter(_.isInstanceOf[Bot.Event.Connecting]).foreach(history.removeEntry(_))
-    history(Bot.Event.Disconnected) = false
+  addRule(Bot.Event.Connected, (history: SynchronizedQueue[BotEvent]) => {
+    history.dequeueAll(_.isInstanceOf[Bot.Event.Connecting])
+    history.dequeueAll(_ == Bot.Event.Disconnected)
   })
-  addRule(Bot.Event.Disconnected, (history: HashSet[bot.Event]) => {
-    history.filter(_.isInstanceOf[Bot.Event.Connecting]).foreach(history.removeEntry(_))
-    history(Bot.Event.Connected) = false
+  addRule(Bot.Event.Disconnected, (history: SynchronizedQueue[BotEvent]) => {
+    history.dequeueAll(_.isInstanceOf[Bot.Event.Connecting])
+    history.dequeueAll(_ == Bot.Event.Connected)
   })
   protected def connect()
   protected def reconnect()
   protected def disconnect()
-  def notify(event: bot.Event) = {
+  def notify(event: BotEvent) = {
     try {
       val skip = Seq(
         """please enter password, salt .*""",
@@ -139,11 +144,11 @@ trait Bot extends Actor with Publisher[bot.Event] with SubscribeSelf[bot.Event] 
           }
         case Bot.Event.Other(_) =>
         case command @ Bot.Event.SendCommand(target, message) =>
-          log.info("send command " + message + " to " + target)
+          log.info("command => " + target + ": " + message)
         case Bot.Event.SendMessage(_, _) =>
         case Bot.Event.ReceiveMessage(target, "please authenticate first") =>
           log.debug("skip message \"please authenticate first\"")
-          processIncommingMessage.set(false)
+          skipIncommingMessage.set(true)
           if (targetUUIDMap.isDefinedAt(target) && Hexapod.locked.isDefinedAt(targetUUIDMap(target)))
             future {
               try {
@@ -156,7 +161,7 @@ trait Bot extends Actor with Publisher[bot.Event] with SubscribeSelf[bot.Event] 
             log.trace("skip authentication against unknown target " + target)
         case Bot.Event.ReceiveMessage(target, "please register first") =>
           log.debug("skip message \"please register first\"")
-          processIncommingMessage.set(false)
+          skipIncommingMessage.set(true)
           future {
             try {
               register(target, null)
@@ -177,7 +182,7 @@ trait Bot extends Actor with Publisher[bot.Event] with SubscribeSelf[bot.Event] 
               }
           }
           if (skip.exists(msg.matches(_)))
-            processIncommingMessage.set(false)
+            skipIncommingMessage.set(true)
         }
       }
     } catch {
@@ -199,7 +204,7 @@ trait Bot extends Actor with Publisher[bot.Event] with SubscribeSelf[bot.Event] 
       publish(Bot.Event.SendCommand(target, message.trim))
       send(target, message.trim)
     } else {
-      log.warn("send command " + message + " to " + target + " forbidden")
+      log.warn("command => " + target + ": " + message + " forbidden")
     }
   }
   def command(hexapod: Hexapod, message: String): Unit = command(hexapod, message, false)
@@ -229,7 +234,7 @@ trait Bot extends Actor with Publisher[bot.Event] with SubscribeSelf[bot.Event] 
                 log.trace("skip authentication against unknown target " + target)
                 null
               } else {
-		MDC.put("UUID" , targetUUIDMap(target).toString())
+                MDC.put("uuid", targetUUIDMap(target).toString())
                 (Hexapod(targetUUIDMap(target)) match {
                   case Some(hexapod) =>
                     if (hexapod.entity.isDefinedAt(this) && hexapod.entity(this).target != target) {
@@ -253,7 +258,7 @@ trait Bot extends Actor with Publisher[bot.Event] with SubscribeSelf[bot.Event] 
                 command(target, "login " + uuid.toString + " " + (new Passwords() {}).generate(16), true)
                 var salt: String = null
                 var peerUUID: String = null
-                val matcher: PartialFunction[bot.Event, Unit] = {
+                val matcher: PartialFunction[BotEvent, Unit] = {
                   case Bot.Event.ReceiveMessage(sender, msg) if (msg.matches("""please enter password, salt .*""") && sender == target) =>
                     salt = msg.drop(28)
                   case Bot.Event.ReceiveMessage(sender, msg) if (msg.matches("""please register first""") && sender == target) =>
@@ -274,7 +279,7 @@ trait Bot extends Actor with Publisher[bot.Event] with SubscribeSelf[bot.Event] 
                   cipherEnc.init(Cipher.ENCRYPT_MODE, Hexapod.locked(hexapod.uuid).encriptionKey.publicKey.getKey("BC"), randomEnc)
                   OpenPGP.encode64(cipherEnc.doFinal(plain)).foreach(str => {
                     command(target, "password " + str, true)
-                    val matcher: PartialFunction[bot.Event, Unit] = {
+                    val matcher: PartialFunction[BotEvent, Unit] = {
                       case Bot.Event.ReceiveMessage(sender, "authentication successful") if (sender == target) =>
                         successful = true
                       case Bot.Event.ReceiveMessage(sender, "authentication failed") if (sender == target) =>
@@ -307,7 +312,7 @@ trait Bot extends Actor with Publisher[bot.Event] with SubscribeSelf[bot.Event] 
       } finally {
         if (authenticationLock(target).isHeldByCurrentThread())
           authenticationLock(target).unlock()
-	MDC.clear()
+        MDC.clear()
       }
     }
   }
@@ -342,23 +347,21 @@ trait Bot extends Actor with Publisher[bot.Event] with SubscribeSelf[bot.Event] 
 
 object Bot {
   object Message {
-    import org.digimead.documentumelasticus.archinid.bot.{ Message => M }
-    case object Connect extends M
-    case object Disconnect extends M
-    case object Reconnect extends M
-    case object Heartbeat extends M
+    case object Connect extends BotMessage
+    case object Disconnect extends BotMessage
+    case object Reconnect extends BotMessage
+    case object Heartbeat extends BotMessage
   }
   object Event {
-    import org.digimead.documentumelasticus.archinid.bot.{ Event => E }
-    case class Connecting(val timestamp: Long) extends E
-    case object Connected extends E
-    case object Disconnected extends E
-    case class UserEnter(val target: String) extends E
-    case class UserLeave(val target: String) extends E
-    case class UserArchinid(val target: String) extends E
-    case class SendCommand(val target: String, val message: String) extends E
-    case class SendMessage(val target: String, val message: String) extends E
-    case class ReceiveMessage(val target: String, val message: String) extends E
-    case class Other(val value: Any) extends E
+    case class Connecting(val timestamp: Long) extends BotEvent
+    case object Connected extends BotEvent
+    case object Disconnected extends BotEvent
+    case class UserEnter(val target: String) extends BotEvent
+    case class UserLeave(val target: String) extends BotEvent
+    case class UserArchinid(val target: String) extends BotEvent
+    case class SendCommand(val target: String, val message: String) extends BotEvent
+    case class SendMessage(val target: String, val message: String) extends BotEvent
+    case class ReceiveMessage(val target: String, val message: String) extends BotEvent
+    case class Other(val value: Any) extends BotEvent
   }
 }

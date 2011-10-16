@@ -44,26 +44,26 @@
  *
  */
 
-package org.digimead.documentumelasticus.archinid
+package org.digimead.documentumelasticus.hexapod
+import de.javawi.jstun.util.Address
 
 import java.util.UUID
 import java.util.concurrent.{ Executors, TimeUnit }
 import java.util.concurrent.atomic.AtomicBoolean
-import net.lag.configgy.Config
-import org.digimead.documentumelasticus.Archinid
-import org.digimead.documentumelasticus.Hexapod
+import org.digimead.documentumelasticus.helper.Config
 import org.digimead.documentumelasticus.helper.Publisher
+import org.digimead.documentumelasticus.hexapod.archinid.Archinid
+import org.digimead.documentumelasticus.hexapod.bot.Bot
+import org.digimead.documentumelasticus.hexapod.bot.BotEvent
 import scala.actors.Actor
 import scala.actors.Future
 import scala.collection.mutable.Subscriber
 import scala.collection.mutable.{ HashMap, SynchronizedMap }
 import scala.collection.immutable.{ HashMap => IHashMap }
 
-package pool {
-  sealed trait Event
-}
+sealed trait PoolEvent
 
-trait PoolSingleton extends Publisher[pool.Event] {
+trait PoolSingleton extends Publisher[PoolEvent] {
   val entityType: IHashMap[String, Class[_ <: Bot]] // for example Map("irc" -> ....getClass, "jabber" -> ....getClass)
   protected val nodeMap = new HashMap[UUID, Archinid] with SynchronizedMap[UUID, Archinid]
   protected val initialized: AtomicBoolean = new AtomicBoolean(false)
@@ -76,19 +76,25 @@ trait PoolSingleton extends Publisher[pool.Event] {
   protected var config: Config = null
   protected def createBot(botType: String, botServer: String, config: Config): Bot
   def initialize(c: Config) {
-    import org.digimead.documentumelasticus.archinid.bot
     log.info("initialize " + getClass.getName())
     config = c
+  }
+  def kick() {
+    log.trace("kick")
+    entity.values.map(_.values).flatten.foreach(b => Bot.Message.Reconnect)
+  }
+  def run() {
+    log.info("run")
     entityType.keys.foreach(t => {
-      val server = config.getConfigMap("archinid." + t + ".server").map(cm => cm.keys).getOrElse(List()).toSeq
+      val server = config.getConfigMap(t + ".server").map(cm => cm.keys).getOrElse(List()).toSeq
       log.debug("run " + t + " for servers [" + server.mkString(",") + "]")
       server.foreach(s => {
         entity(t)(s) = createBot(t, s, config)
       })
     })
     entities.foreach(entity => {
-      val subscriber = new Subscriber[bot.Event, entity.Pub] {
-        def notify(pub: entity.Pub, event: bot.Event): Unit = {
+      val subscriber = new Subscriber[BotEvent, entity.Pub] {
+        def notify(pub: entity.Pub, event: BotEvent): Unit = {
           event match {
             case e@Bot.Event.Connected => publish(Event.Changed(entity, e))
             case e@Bot.Event.Disconnected => publish(Event.Changed(entity, e))
@@ -98,14 +104,7 @@ trait PoolSingleton extends Publisher[pool.Event] {
       }
       entity.subscribe(subscriber)
     })
-  }
-  def kick() {
-    log.trace("kick")
-    entity.values.map(_.values).flatten.foreach(b => Bot.Message.Reconnect)
-  }
-  def run() {
-    log.info("run")
-    val timeout = config.getInt("archinid.heartbeat").getOrElse(10) * 1000 // 10 seconds
+    val timeout = config.getInt("heartbeat").getOrElse(10) * 1000 // 10 seconds
     val runnable = new Runnable { def run = entities.par.foreach(b => b ! Bot.Message.Heartbeat) }
     watchdog.scheduleAtFixedRate(runnable, 0, timeout, TimeUnit.MILLISECONDS)
     entities.par.foreach(b => b ! Bot.Message.Connect)
@@ -125,7 +124,7 @@ trait PoolSingleton extends Publisher[pool.Event] {
         val archinid = if (nodeMap.isDefinedAt(info.uuid))
           nodeMap(info.uuid)
         else
-          new Archinid(info.uuid, this)
+          new Archinid(info.uuid, info.publicIP, info.consolePort, this)
         updateNode(archinid, info)
       case _ =>
         log.warn("add archinid " + target + " failed")
@@ -144,8 +143,7 @@ trait PoolSingleton extends Publisher[pool.Event] {
       publish(Event.Ready)
     }
   }
-  def getNode = {
-  }
+  def bestNode = nodeMap.head._2
   def delNode(uuid: UUID) = nodeMap.synchronized {
     nodeMap.remove(uuid)
   }
@@ -160,7 +158,7 @@ trait PoolSingleton extends Publisher[pool.Event] {
   def entities = entity.values.map(_.values).flatten
   def entities(typeName: String) = entity.getOrElse(typeName, new HashMap[String, Bot]())
   object Event {
-    case object Ready extends pool.Event
-    case class Changed(bot: Bot, e: org.digimead.documentumelasticus.archinid.bot.Event) extends pool.Event
+    case object Ready extends PoolEvent
+    case class Changed(bot: Bot, e: BotEvent) extends PoolEvent
   }
 }

@@ -44,21 +44,23 @@
  *
  */
 
-package org.digimead.documentumelasticus.archinid.bot
+package org.digimead.documentumelasticus.hexapod.bot.jabber
 
 import java.util.UUID
 import java.util.concurrent.atomic.{ AtomicInteger, AtomicLong }
-import net.lag.configgy.Config
-import org.digimead.documentumelasticus.Archinid
-import org.digimead.documentumelasticus.Hexapod
-import org.digimead.documentumelasticus.archinid.Reply
-import org.digimead.documentumelasticus.archinid.{ Bot, PoolSingleton, ProcessSingleton, Request }
+import org.digimead.documentumelasticus.helper.SubscribeSelf
+import org.digimead.documentumelasticus.hexapod.Hexapod
+import org.digimead.documentumelasticus.hexapod.HexapodChanged
+import org.digimead.documentumelasticus.hexapod.HexapodEvent
+import org.digimead.documentumelasticus.hexapod.PoolSingleton
+import org.digimead.documentumelasticus.hexapod.ProcessSingleton
+import org.digimead.documentumelasticus.hexapod.Reply
+import org.digimead.documentumelasticus.hexapod.Request
+import org.digimead.documentumelasticus.hexapod.archinid.Archinid
+import org.digimead.documentumelasticus.hexapod.bot.Bot
+import org.digimead.documentumelasticus.hexapod.bot.BotEvent
 import org.digimead.documentumelasticus.helper.{ Publisher, SubscribeSelf }
-import org.jivesoftware.smack.Connection
-import org.jivesoftware.smack.PacketListener
-import org.jivesoftware.smack.filter.PacketFilter
-import org.jivesoftware.smack.packet.Presence
-import org.jivesoftware.smack.{ Chat, ChatManagerListener, ConnectionConfiguration, ConnectionListener, MessageListener, Roster, RosterListener, XMPPConnection }
+import org.jivesoftware.smack.{ Chat, ChatManagerListener, Connection, ConnectionConfiguration, ConnectionListener, MessageListener, Roster, RosterListener, XMPPConnection }
 import org.jivesoftware.smack.XMPPConnection
 import org.jivesoftware.smack.packet.{ Message => JMessage, Packet, Presence }
 import org.jivesoftware.smack.util.StringUtils
@@ -66,18 +68,17 @@ import org.slf4j.Logger
 import scala.actors.Actor
 import scala.actors.Futures._
 import scala.collection.JavaConversions._
+import scala.collection.mutable.HashSet
+import scala.collection.mutable.SynchronizedSet
 import scala.collection.mutable.{ HashMap, Subscriber, SynchronizedMap }
 
-package jabber {
-  sealed trait Event
-  sealed trait Message
-}
+sealed trait JabberEvent
+sealed trait JabberMessage
 
-trait JabberEntity extends Bot with SubscribeSelf[Event] {
+trait JabberEntity extends Bot with SubscribeSelf[BotEvent] {
   private val that = this
   val uuid = UUID.fromString(config.getString("uuid").getOrElse(""))
   val server: String
-  val config: Config
   val Process: ProcessSingleton
   val Jabber: JabberSingleton
   val Pool: PoolSingleton
@@ -85,6 +86,7 @@ trait JabberEntity extends Bot with SubscribeSelf[Event] {
   lazy val smack = new Bot(log)
   val timeout = 10000 // 10s timeout for any reaction, slow transport
   val lock = new java.util.concurrent.locks.ReentrantLock
+  val skipUserMessage = new HashSet[String] with SynchronizedSet[String]
   Hexapod.subscribe(new subscriberHexapodNew())
   start()
   def act() {
@@ -112,11 +114,11 @@ trait JabberEntity extends Bot with SubscribeSelf[Event] {
       }
     }
   }
-  override def notify(event: Event) = {
+  override def notify(event: BotEvent) = {
     super.notify(event)
     event match {
-      case Bot.Event.Other(v @ value) if v.isInstanceOf[jabber.Event] =>
-        v.asInstanceOf[jabber.Event] match {
+      case Bot.Event.Other(v @ value) if v.isInstanceOf[JabberEvent] =>
+        v.asInstanceOf[JabberEvent] match {
           case that.Jabber.Event.RosterEntriesAdded(entries) =>
             entries.foreach(e => publish(Bot.Event.UserEnter(e.asInstanceOf[String])))
           case that.Jabber.Event.RosterEntriesDeleted(entries) =>
@@ -150,7 +152,7 @@ trait JabberEntity extends Bot with SubscribeSelf[Event] {
     clearEvent()
     publish(Bot.Event.Connecting(System.currentTimeMillis))
     if (password() == "") {
-      log.warn("key archinid.irc.server." + server + ".password not found in configuration file")
+      log.warn("key jabber.server." + server + ".password not found in configuration file")
       publish(Bot.Event.Disconnected)
       return
     }
@@ -160,12 +162,12 @@ trait JabberEntity extends Bot with SubscribeSelf[Event] {
       return
     }
     try {
-      log.info("try to connect to network [" + server + "] at [" + uri + "] as " + smack.nick)
+      log.info("try to connect to network [" + server + "] at [" + uri + "] as " + nick())
       if (smack.connect(nick(), password())) {
-        if (!history(Bot.Event.Connected))
+        if (!history.exists(_ == Bot.Event.Connected))
           publish(Bot.Event.Connected)
       } else {
-        if (!history(Bot.Event.Disconnected))
+        if (!history.exists(_ == Bot.Event.Disconnected))
           publish(Bot.Event.Disconnected)
       }
     } catch {
@@ -185,7 +187,7 @@ trait JabberEntity extends Bot with SubscribeSelf[Event] {
     if (!silent)
       log.trace("disconnect")
     smack.disconnect()
-    if (!history(Bot.Event.Disconnected))
+    if (!history.exists(_ == Bot.Event.Disconnected))
       publish(Bot.Event.Disconnected)
   }
   def dispose() {
@@ -196,7 +198,7 @@ trait JabberEntity extends Bot with SubscribeSelf[Event] {
     if (lock.tryLock()) {
       try {
         if (smack.nick != "" && smack.password != "" && smack.authFailCounter.get < 3 && smack.connection != null) {
-          if (history(Bot.Event.Connected) && smack.connection.isConnected() && smack.connection.isAuthenticated()) {
+          if (history.exists(_ == Bot.Event.Connected) && smack.connection.isConnected() && smack.connection.isAuthenticated()) {
             val presence = smack.connection.getRoster().getPresence(smack.connection.getUser())
             if (presence.getType != Presence.Type.available) {
               log.warn("presence status lost (current status is " + presence + "), recover")
@@ -226,11 +228,11 @@ trait JabberEntity extends Bot with SubscribeSelf[Event] {
   private def processMessage(chat: Chat, message: JMessage) {
     try {
       val sender = StringUtils.parseBareAddress(message.getFrom())
-      if (!processIncommingMessage.get()) {
-        processIncommingMessage.set(true)
+      if (skipIncommingMessage.get()) {
+        skipIncommingMessage.set(false)
         return
       }
-      if (sender == smack.nick + "@" + smack.connection.getServiceName)
+      if (skipUserMessage(sender))
         return
       val msgseq = message.getBody.split("\n").map(_.trim())
       message.getBody.trim match {
@@ -246,7 +248,7 @@ trait JabberEntity extends Bot with SubscribeSelf[Event] {
           val id = message.substring(5, message.length - 42).split("#")
           val hash = (id(0)).toInt + sender.hashCode
           val (blockN, blocksTotal) = id(1).split("/").map(_.toInt).toSeq match { case x => (x.head, x.last) }
-          log.debug("[BLOCK] receive pong " + blockN + "/" + blocksTotal + " with hash " + hash)
+          log.info("[BLOCK] receive pong " + blockN + "/" + blocksTotal + " with hash " + hash)
           Hexapod(this, sender).foreach(_.entity(this).health = true)
           Request ! Reply(this.hashCode, hash, blockN, blocksTotal, "pong")
         case message if message.matches("""(?s)--- \[[-0-9]+#\d+/\d+\] begin of message block ---.*--- end of message block ---""") =>
@@ -254,7 +256,7 @@ trait JabberEntity extends Bot with SubscribeSelf[Event] {
           val id = lines.head.substring(5, lines.head.length - 28).split("#")
           val hash = (id(0)).toInt + sender.hashCode
           val (blockN, blocksTotal) = id(1).split("/").map(_.toInt).toSeq match { case x => (x.head, x.last) }
-          log.debug("[BLOCK] receive block " + blockN + "/" + blocksTotal + " with hash " + hash)
+          log.info("[BLOCK] receive block " + blockN + "/" + blocksTotal + " with hash " + hash)
           Request ! Reply(this.hashCode, hash, blockN, blocksTotal, lines.drop(1).dropRight(1).mkString("\n"))
         case message =>
           Process ! Process.Message.Command(this, sender, Hexapod(this, sender), message)
@@ -264,9 +266,9 @@ trait JabberEntity extends Bot with SubscribeSelf[Event] {
     }
   }
   private def nick() = uuid.toString
-  private def password() = config.getString("archinid.jabber.server." + server + ".password").getOrElse("")
-  private def uri() = config.getString("archinid.jabber.server." + server + ".uri").get
-  private def port() = config.getInt("archinid.jabber.server." + server + ".port").getOrElse(5222)
+  private def password() = config.getString("jabber.server." + server + ".password").getOrElse("")
+  private def uri() = config.getString("jabber.server." + server + ".uri").get
+  private def port() = config.getInt("jabber.server." + server + ".port").getOrElse(5222)
   class Bot(val log: Logger) {
     assert(log != null)
     val options = new ConnectionConfiguration(uri(), port())
@@ -330,6 +332,9 @@ trait JabberEntity extends Bot with SubscribeSelf[Event] {
        */
       if (Stash.nick != nick || Stash.password != password)
         authFailCounter.set(0) // reset counter if parameter changed
+      if (!Stash.nick.isEmpty)
+        skipUserMessage(Stash.nick + "@" + smack.connection.getServiceName) = false
+      skipUserMessage(nick + "@" + smack.connection.getServiceName) = true
       Stash.nick = nick
       Stash.password = password
       options.setReconnectionAllowed(false)
@@ -405,8 +410,8 @@ trait JabberEntity extends Bot with SubscribeSelf[Event] {
   /*
    * add archinids to roster
    */
-  class subscriberHexapodNew() extends Subscriber[org.digimead.documentumelasticus.hexapod.Event, Hexapod.ObjectH#Pub] {
-    def notify(pub: Hexapod.ObjectH#Pub, event: org.digimead.documentumelasticus.hexapod.Event): Unit = {
+  class subscriberHexapodNew() extends Subscriber[HexapodEvent, Hexapod.ObjectH#Pub] {
+    def notify(pub: Hexapod.ObjectH#Pub, event: HexapodEvent): Unit = {
       event match {
         case Hexapod.Event.New(hexapod) if hexapod.isInstanceOf[Archinid] =>
           hexapod.subscribe(new subscriberHexapodAdd(hexapod))
@@ -414,8 +419,8 @@ trait JabberEntity extends Bot with SubscribeSelf[Event] {
       }
     }
   }
-  class subscriberHexapodAdd(hexapod: Hexapod) extends Subscriber[org.digimead.documentumelasticus.hexapod.Changed, Hexapod#InstanceH#Pub] {
-    def notify(pub: Hexapod#InstanceH#Pub, event: org.digimead.documentumelasticus.hexapod.Changed): Unit = {
+  class subscriberHexapodAdd(hexapod: Hexapod) extends Subscriber[HexapodChanged, Hexapod#InstanceH#Pub] {
+    def notify(pub: Hexapod#InstanceH#Pub, event: HexapodChanged): Unit = {
       if (hexapod.entity.isDefinedAt(that) && hexapod.entity(that).health && hexapod.entity(that).authenticated) {
         hexapod.removeSubscription(this)
         val roster = smack.connection.getRoster()
@@ -443,14 +448,14 @@ trait JabberSingleton {
   }
   object Event {
     case class Message(val chat: Chat, val message: JMessage)
-    case class NewRoster(r: Roster) extends jabber.Event
-    case class RosterEntriesDeleted[T](entries: Iterable[T]) extends jabber.Event
-    case class RosterEntriesUpdated[T](entries: Iterable[T]) extends jabber.Event
-    case class RosterEntriesAdded[T](entries: Iterable[T]) extends jabber.Event
-    case class RosterPresenceChanged(p: Presence) extends jabber.Event
-    case class NewChat(chat: Chat) extends jabber.Event
-    case class RecvMsg(chat: Chat, msg: JMessage) extends jabber.Event
-    case class BulkMsg(chat: Chat, msg: List[JMessage]) extends jabber.Event
+    case class NewRoster(r: Roster) extends JabberEvent
+    case class RosterEntriesDeleted[T](entries: Iterable[T]) extends JabberEvent
+    case class RosterEntriesUpdated[T](entries: Iterable[T]) extends JabberEvent
+    case class RosterEntriesAdded[T](entries: Iterable[T]) extends JabberEvent
+    case class RosterPresenceChanged(p: Presence) extends JabberEvent
+    case class NewChat(chat: Chat) extends JabberEvent
+    case class RecvMsg(chat: Chat, msg: JMessage) extends JabberEvent
+    case class BulkMsg(chat: Chat, msg: List[JMessage]) extends JabberEvent
   }
 }
 

@@ -44,14 +44,23 @@
  *
  */
 
-package org.digimead.documentumelasticus
+package org.digimead.documentumelasticus.hexapod.archinid
+import de.javawi.jstun.util.Address
+import de.javawi.jstun.util.Address
 
 import java.util.UUID
 import java.util.concurrent.{ Executors, TimeUnit }
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.ReentrantLock
-import org.digimead.documentumelasticus.archinid.PoolSingleton
-import org.digimead.documentumelasticus.archinid.{ Bot, Component, Info, InfoAkka, InfoIRC, InfoJabber, Request }
+import org.digimead.documentumelasticus.hexapod.Hexapod
+import org.digimead.documentumelasticus.hexapod.Info
+import org.digimead.documentumelasticus.hexapod.InfoAkka
+import org.digimead.documentumelasticus.hexapod.InfoIRC
+import org.digimead.documentumelasticus.hexapod.InfoJabber
+import org.digimead.documentumelasticus.hexapod.PoolSingleton
+import org.digimead.documentumelasticus.hexapod.Request
+import org.digimead.documentumelasticus.hexapod.bot.Bot
+import org.digimead.documentumelasticus.hexapod.bot.BotEvent
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import scala.actors.Actor
@@ -59,9 +68,12 @@ import scala.actors.Futures._
 import scala.actors.threadpool.AtomicInteger
 import scala.collection.mutable.{ ArrayBuffer, HashMap, Subscriber, SynchronizedBuffer }
 
-class Archinid(uuid: UUID, val Pool: PoolSingleton) extends Hexapod(uuid, "archinid", LoggerFactory.getLogger(classOf[Archinid].getName)) {
-  override protected def initialize: AnyRef = new InstanceA
-  class InstanceA() extends super.InstanceH(uuid, kind, log, this) with Actor {
+class Archinid(uuid: UUID, _publicIP: Address, _consolePort: Int, Pool: PoolSingleton) extends Hexapod(uuid, "archinid", LoggerFactory.getLogger(classOf[Archinid].getName)) {
+  override protected def initialize: AnyRef = new InstanceA(Some(_publicIP), _consolePort match {
+    case n if (n > 0 && n <= 65535) => Some(n)
+    case _ => None
+  })
+  class InstanceA(publicIP: Option[Address], consolePort: Option[Int]) extends super.InstanceH(uuid, publicIP, consolePort, kind, log, this) with Actor {
     val prio: Array[String] = Array("akka", "jabber", "irc")
     var id: Seq[String] = Seq()
     var lastSeen: Long = 0
@@ -72,12 +84,14 @@ class Archinid(uuid: UUID, val Pool: PoolSingleton) extends Hexapod(uuid, "archi
     start()
     init()
     log.info("active " + uuid)
-    def components(option: String, timeout: Int = 60000): Seq[Component] = {
-      log.debug("get components [" + option + "] with timeout " + timeout)
-      var result: Seq[Component] = null
-      var counter = 1
-      // TODO
-      result
+    def components(option: String, timeoutSeconds: Int = -1): Seq[Component] = {
+      log.debug("get components [" + option + "] with timeout " + timeoutSeconds + "s")
+      val a = bestEntity.map(entity => Archinid.components(entity.bot, entity.target, option, timeoutSeconds))
+      /*match {
+	case Some(n) => n
+	case None => Seq()
+	}*/
+      null
     }
     def status(timeout: Int = 60000): Option[Info] = {
       log.debug("get status with timeout " + timeout)
@@ -111,11 +125,9 @@ class Archinid(uuid: UUID, val Pool: PoolSingleton) extends Hexapod(uuid, "archi
       scheduler
     }
     private def init() {
-      import org.digimead.documentumelasticus.archinid.bot.Event
-      import org.digimead.documentumelasticus.archinid.Bot
       entity.values.foreach(entity => {
-        val subscriber = new Subscriber[Event, entity.bot.Pub] {
-          def notify(pub: entity.bot.Pub, event: Event): Unit = {
+        val subscriber = new Subscriber[BotEvent, entity.bot.Pub] {
+          def notify(pub: entity.bot.Pub, event: BotEvent): Unit = {
             event match {
               case Bot.Event.Connected =>
                 log.debug("bot " + entity.bot + " connected")
@@ -140,9 +152,9 @@ class Archinid(uuid: UUID, val Pool: PoolSingleton) extends Hexapod(uuid, "archi
       })
       Pool.addNode(box.asInstanceOf[Archinid])
     }
-    override def dispose() {
+    override def dispose(replaceBy: Hexapod = null) {
       log.info("dispose archinid " + uuid)
-      super.dispose()
+      super.dispose(replaceBy)
       Pool.delNode(uuid)
     }
     private def checkArchinidBotState(entity: BotEntity) {
@@ -181,7 +193,7 @@ object Archinid {
   def ping(bot: Bot, target: String, timeoutSeconds: Int = -1, retry: Int = 3): Boolean = {
     log.debug("ping target " + target + " with timeout " + timeoutSeconds + "s")
     Request(target, bot, Request.Message.Ping).
-      setTimeoutSeconds(if (timeoutSeconds < 0) bot.timeout else timeoutSeconds).
+      setTimeoutSeconds(if (timeoutSeconds < 0) (bot.timeout / 1000) else timeoutSeconds).
       setLogger(log).
       setRetry(retry).
       send[Option[Any]] match {
@@ -198,7 +210,7 @@ object Archinid {
         log.debug("empty components block from " + target)
         throw new RuntimeException // switch to onFail
       } else {
-        str.split("\n").map(str => {
+        str.split("\n").par.map(str => {
           val componentEntry(componentName) = str
           log.debug("request information about \"" + componentName + "\" component")
           val requestDetails = Request(target, bot, Request.Message.Simple("component " + componentName))
@@ -216,18 +228,19 @@ object Archinid {
             }
           })
           requestDetails.setRetry(3)
-          requestDetails.setTimeoutSeconds(if (timeoutSeconds < 0) bot.timeout * 3 else timeoutSeconds)
+          requestDetails.setTimeoutSeconds(if (timeoutSeconds < 0) (bot.timeout / 1000) * 3 else timeoutSeconds)
           requestDetails.setLogger(log)
           requestDetails.send[Option[Component]].getOrElse(null)
-        }).filter(_ != null)
+        }).filter(_ != null).seq
       }
     })
     requestComponent.setRetry(3)
-    requestComponent.setTimeoutSeconds(if (timeoutSeconds < 0) bot.timeout * 3 else timeoutSeconds)
+    requestComponent.setTimeoutSeconds(if (timeoutSeconds < 0) (bot.timeout / 1000) * 3 else timeoutSeconds)
     requestComponent.setLogger(log)
     requestComponent.send[Option[Seq[Component]]].getOrElse(Seq())
   }
-  private def componentsParseDetails(block: String) {
+  private def componentsParseDetails(block: String): Option[Component] = {
+    log.debug("parse component information")
     val replyMap: HashMap[String, Any] = HashMap()
     var versions: Map[String, Map[String, String]] = Map()
     var currentVersion: Tuple3[String, String, String] = Tuple3("", "", "") // name, id, url
@@ -264,7 +277,7 @@ object Archinid {
     if (currentVersion != "")
       versions = versions.updated(currentVersion._1, currentVersionMap)
     // instantiate component
-    new Component(replyMap.getOrElse("url", "http://").asInstanceOf[String],
+    Some(new Component(replyMap.getOrElse("url", "http://").asInstanceOf[String],
       replyMap.getOrElse("homepage", "http://").asInstanceOf[String],
       replyMap.getOrElse("watchers", "0").asInstanceOf[String].toInt,
       replyMap.getOrElse("created_at", "lost").asInstanceOf[String],
@@ -273,7 +286,7 @@ object Archinid {
       replyMap.getOrElse("name", "lost").asInstanceOf[String],
       replyMap.getOrElse("description", "lost").asInstanceOf[String],
       replyMap.getOrElse("open_issues", "0").asInstanceOf[String].toInt,
-      null)
+      null))
   }
   def status(bot: Bot, target: String, timeoutSeconds: Int = -1): Option[Info] = {
     log.debug("get status with timeout " + timeoutSeconds + "s")
@@ -284,12 +297,12 @@ object Archinid {
         throw new RuntimeException // switch to onFail
       } else {
         val buffer = str.split("\n")
-        if (!buffer(0).matches("""([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}) at (\d+\.\d+\.\d+\.\d+).*""")) {
+        if (!buffer(0).matches("""([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}) at (\d+\.\d+\.\d+\.\d+):(-?\d+).*""")) {
           log.debug("skip broken status block from " + target)
           None
         } else {
-          val rHead = """([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}) at (\d+\.\d+\.\d+\.\d+).*""".r
-          val rHead(uuid, ip) = buffer(0)
+          val rHead = """([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}) at (\d+\.\d+\.\d+\.\d+):(-?\d+).*""".r
+          val rHead(uuid, ip, consolePort) = buffer(0)
           val rIRC = """IRC: nick "(.*)" server "(.*)" channels "(.*)"""".r
           val irc: Seq[InfoIRC] = buffer.filter(_.startsWith("IRC: ")).map(str => {
             val rIRC(nick, server, channels) = str
@@ -303,12 +316,12 @@ object Archinid {
           // TODO parse akka
           val akka: Seq[InfoAkka] = Seq()
           val uuidParsed = UUID.fromString(uuid)
-          Info(uuidParsed, ip, irc, jabber, akka)
+          Info(uuidParsed, new Address(ip), consolePort.toInt, irc, jabber, akka)
         }
       }
     })
     requestStatus.setRetry(3)
-    requestStatus.setTimeoutSeconds(if (timeoutSeconds < 0) bot.timeout * 3 else timeoutSeconds)
+    requestStatus.setTimeoutSeconds(if (timeoutSeconds < 0) (bot.timeout / 1000) * 3 else timeoutSeconds)
     requestStatus.setLogger(log)
     requestStatus.send[Option[Info]]
   }

@@ -44,10 +44,10 @@
  *
  */
 
-package org.digimead.documentumelasticus.helper
+package org.digimead.documentumelasticus.helper.openpgp
+
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
-
 import java.security.{ KeyPairGenerator, SecureRandom, Security }
 import java.util.Date
 import org.bouncycastle.bcpg.ArmoredOutputStream
@@ -64,9 +64,6 @@ import org.bouncycastle.openpgp.PGPPublicKeyEncryptedData
 import org.bouncycastle.openpgp.PGPUtil
 import org.bouncycastle.openpgp.{ PGPKeyPair, PGPKeyRingGenerator }
 import org.bouncycastle.openpgp.{ PGPSignatureSubpacketGenerator, PGPSignatureSubpacketVector }
-import org.digimead.documentumelasticus.helper.openpgp.Key
-import org.digimead.documentumelasticus.helper.openpgp.Locked
-import org.digimead.documentumelasticus.helper.openpgp.{ AsymmetricAlgorithm, CompressionAlgorithm, HashAlgorithm, KeyFlag, KeySet, SignatureType, SymmetricAlgorithm, Unlocked }
 import org.slf4j.LoggerFactory
 import scala.actors.Futures.future
 import org.bouncycastle.util.encoders.Base64

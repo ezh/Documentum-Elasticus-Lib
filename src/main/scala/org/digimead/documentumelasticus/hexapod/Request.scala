@@ -44,19 +44,15 @@
  *
  */
 
-package org.digimead.documentumelasticus.archinid
+package org.digimead.documentumelasticus.hexapod
 
-import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledExecutorService
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicReference
-import org.slf4j.Logger
-import org.slf4j.LoggerFactory
+import java.util.concurrent.{Executors, ScheduledExecutorService, TimeUnit}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReference}
+import org.digimead.documentumelasticus.hexapod.bot.Bot
+import org.slf4j.{Logger, LoggerFactory, MDC}
 import scala.actors.Actor
-import scala.collection.mutable.{ HashMap, SynchronizedMap }
-import scala.math.BigInt
+import scala.actors.Futures.future
+import scala.collection.mutable.{HashMap, SynchronizedMap}
 
 /*
  * Request(target, bot, Ping, key) onSuccess { ... } onFail { ... } setTimeout(...) send
@@ -66,16 +62,14 @@ import scala.math.BigInt
  * RuntimeException in onSuccess fire onFail callback
  */
 
-protected[this] sealed trait Type {
+protected[this] sealed trait RequestType {
   val message: String
 }
 
-package request {
-  sealed trait Event
-  sealed trait Message
-}
+sealed trait RequestEvent
+sealed trait RequestMessage
 
-class Request(val target: String, val bot: Bot, val t: Type, val key: String) {
+class Request(val target: String, val bot: Bot, val t: RequestType, val key: String) {
   private var log = LoggerFactory.getLogger(getClass)
   private val botType = bot.getClass.getName.split("\\.").last
   private val retry = new AtomicInteger(0)
@@ -84,6 +78,9 @@ class Request(val target: String, val bot: Bot, val t: Type, val key: String) {
   private var timeout = Request.maximumTimeout
   private var success: (String) => Any = (str) => (str)
   private val successWrapper = (str: String) => result.synchronized {
+    MDC.put("key", key)
+    MDC.put("target", target)
+    MDC.put("bot", bot.toString())
     t match {
       case Request.Message.Ping => log.trace("[SENDPING] successful for " + botType + " " + target)
       case Request.Message.Simple(message) => log.trace("[SENDSIMPLE] successful for " + botType + " " + target + " " + message)
@@ -104,26 +101,40 @@ class Request(val target: String, val bot: Bot, val t: Type, val key: String) {
       result.set(r)
       if (timeoutWatcher.get != null)
         timeoutWatcher.get.shutdownNow
-      if (Request.requestMap.isDefinedAt(key))
-        Request.requestMap.remove(key)
+      if (Request.requestMap.isDefinedAt(key)) {
+        (Request.requestMap(key).filterNot(_ == this)) match {
+          case Nil =>
+            log.trace("remove key " + key)
+            Request.requestMap.remove(key)
+          case list =>
+            log.trace("remove request from key " + key)
+            Request.requestMap(key) = list
+        }
+      }
       result.notifyAll
     } else {
       // fail (RuntimeException)
       failWrapper()
     }
+    MDC.remove("key")
+    MDC.remove("target")
+    MDC.remove("bot")
   }
   private var fail: () => Any = () => None
   private val failWrapper = () => result.synchronized {
+    MDC.put("key", key)
+    MDC.put("target", target)
+    MDC.put("bot", bot.toString())
     t match {
       case Request.Message.Ping => log.trace("[SENDPING] failed for " + botType + " " + target)
       case Request.Message.Simple(message) => log.trace("[SENDSIMPLE] failed for " + botType + " " + target + " " + message)
       case Request.Message.Complex(message, limit) => log.trace("[SENDCOMPLEX] failed for " + botType + " " + target + " " + message)
     }
     if (retry.getAndDecrement > 0) {
-      log.warn("request " + t + " thru " + bot + " to " + target + " failed, retry " + retry.get)
+      log.warn("request " + t + " failed, retry " + retry.get)
       send()
     } else {
-      log.warn("request " + t + " thru " + bot + " to " + target + " failed")
+      log.warn("request " + t + " failed")
       val r = fail() match {
         // return Option, not Option[Option[...]]
         case r: Option[_] => r
@@ -132,10 +143,21 @@ class Request(val target: String, val bot: Bot, val t: Type, val key: String) {
       result.set(r)
       if (timeoutWatcher.get != null)
         timeoutWatcher.get.shutdownNow
-      if (Request.requestMap.isDefinedAt(key))
-        Request.requestMap.remove(key)
+      if (Request.requestMap.isDefinedAt(key)) {
+        (Request.requestMap(key).filterNot(_ == this)) match {
+          case Nil =>
+            log.trace("remove key " + key)
+            Request.requestMap.remove(key)
+          case list =>
+            log.trace("remove request from key " + key)
+            Request.requestMap(key) = list
+        }
+      }
       result.notifyAll
     }
+    MDC.remove("key")
+    MDC.remove("target")
+    MDC.remove("bot")
   }
   val result = new AtomicReference[Option[Any]](null)
   def onSuccess[T](block: String => T): Request = synchronized {
@@ -166,6 +188,9 @@ class Request(val target: String, val bot: Bot, val t: Type, val key: String) {
     this
   }
   def send(): Unit = {
+    MDC.put("key", key)
+    MDC.put("target", target)
+    MDC.put("bot", bot.toString())
     t match {
       case Request.Message.Ping =>
         log.trace("[SENDPING] to " + botType + " " + target + " with timeout " + timeout)
@@ -179,8 +204,14 @@ class Request(val target: String, val bot: Bot, val t: Type, val key: String) {
       timeoutWatcher.get.shutdownNow
     timeoutWatcher.set(Executors.newSingleThreadScheduledExecutor())
     timeoutWatcher.get.schedule(new Runnable { def run = failWrapper() }, timeout, TimeUnit.MILLISECONDS)
+    MDC.remove("key")
+    MDC.remove("target")
+    MDC.remove("bot")
   }
   def send[T <% Option[_]]: T = {
+    MDC.put("key", key)
+    MDC.put("target", target)
+    MDC.put("bot", bot.toString())
     send()
     log.trace("wait for " + t + " from " + target + " with key " + key)
     result.synchronized {
@@ -197,7 +228,7 @@ class Request(val target: String, val bot: Bot, val t: Type, val key: String) {
           result.wait
         }
     }
-    try {
+    val r = try {
       val r = result.get.asInstanceOf[T]
       log.trace("wait complete for " + t + " from " + target + ", result " + r)
       result.set(null)
@@ -207,43 +238,51 @@ class Request(val target: String, val bot: Bot, val t: Type, val key: String) {
         log.error(e.getMessage(), e)
         throw e
     }
+    MDC.remove("key")
+    MDC.remove("target")
+    MDC.remove("bot")
+    r
   }
 }
 
 object Request extends Actor {
   val log = LoggerFactory.getLogger(this.getClass)
   private val maximumTimeout = 5 * 60 * 1000
-  private var requestMap = new HashMap[String, Request] with SynchronizedMap[String, Request]
+  private var requestMap = new HashMap[String, Seq[Request]] with SynchronizedMap[String, Seq[Request]]
   start
-  def apply(target: String, bot: Bot, t: Type) = {
-    log.debug("request " + t.message + " from " + target + ", target hash " + target.hashCode + ", message hash " + t.message.hashCode)
+  def apply(target: String, bot: Bot, t: RequestType) = {
     val key = bot.hashCode.toString + "." + (target.hashCode + t.message.hashCode).toString
     val request = new Request(target, bot, t, key)
-    requestMap(key) = request
+    log.debug("request " + t.message + " from " + target + ", target hash " + target.hashCode + ", message hash " + t.message.hashCode + ", key " + key)
+    if (requestMap.isDefinedAt(key))
+      requestMap(key) = requestMap(key) :+ request
+    else
+      requestMap(key) = Seq(request)
     request
   }
   def act {
     loop {
       react {
         case response: Reply =>
-          try {
-            val key = response.botHash.toString + "." + response.blockHash.toString
-            if (requestMap.isDefinedAt(key)) {
-              log.trace("process message " + response.message + " with key " + key)
-              requestMap(key).successWrapper(response.message)
-            } else {
-              log.trace("skip message " + response.message + " with key " + key)
-            }
-          } catch { case e => log.error(e.getMessage, e) }
+          future {
+            try {
+              val key = response.botHash.toString + "." + response.blockHash.toString
+              if (requestMap.isDefinedAt(key)) {
+                log.trace("process message " + response.message + " with key " + key)
+                requestMap(key).foreach(_.successWrapper(response.message))
+              } else {
+                log.trace("skip message " + response.message + " with key " + key)
+              }
+            } catch { case e => log.error(e.getMessage, e) }
+          }
         case message =>
           log.error("unknow message" + message)
       }
     }
   }
   object Message {
-    case object Ping extends Type { val message = "ping" }
-    case class Simple(val message: String) extends Type
-    case class Complex(val message: String, limit: Int = 0) extends Type // limit messages
+    case object Ping extends RequestType { val message = "ping" }
+    case class Simple(val message: String) extends RequestType
+    case class Complex(val message: String, limit: Int = 0) extends RequestType // limit messages
   }
 }
-
