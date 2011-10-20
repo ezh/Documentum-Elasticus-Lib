@@ -45,28 +45,18 @@
  */
 
 package org.digimead.documentumelasticus.hexapod.archinid
-import de.javawi.jstun.util.Address
-import de.javawi.jstun.util.Address
 
+import de.javawi.jstun.util.Address
+import java.io.File
 import java.util.UUID
 import java.util.concurrent.{ Executors, TimeUnit }
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.ReentrantLock
-import org.digimead.documentumelasticus.hexapod.Hexapod
-import org.digimead.documentumelasticus.hexapod.Info
-import org.digimead.documentumelasticus.hexapod.InfoAkka
-import org.digimead.documentumelasticus.hexapod.InfoIRC
-import org.digimead.documentumelasticus.hexapod.InfoJabber
-import org.digimead.documentumelasticus.hexapod.PoolSingleton
-import org.digimead.documentumelasticus.hexapod.Request
-import org.digimead.documentumelasticus.hexapod.bot.Bot
-import org.digimead.documentumelasticus.hexapod.bot.BotEvent
-import org.slf4j.Logger
-import org.slf4j.LoggerFactory
+import org.digimead.documentumelasticus.hexapod.{ Hexapod, Info, InfoAkka, InfoIRC, InfoJabber, PoolSingleton, Request }
+import org.digimead.documentumelasticus.hexapod.bot.{ Bot, BotEvent }
+import org.slf4j.{ Logger, LoggerFactory }
 import scala.actors.Actor
 import scala.actors.Futures._
-import scala.actors.threadpool.AtomicInteger
-import scala.collection.mutable.{ ArrayBuffer, HashMap, Subscriber, SynchronizedBuffer }
+import scala.collection.mutable.{ HashMap, Subscriber, SynchronizedBuffer }
 
 class Archinid(uuid: UUID, _publicIP: Address, _consolePort: Int, Pool: PoolSingleton) extends Hexapod(uuid, "archinid", LoggerFactory.getLogger(classOf[Archinid].getName)) {
   override protected def initialize: AnyRef = new InstanceA(Some(_publicIP), _consolePort match {
@@ -84,14 +74,9 @@ class Archinid(uuid: UUID, _publicIP: Address, _consolePort: Int, Pool: PoolSing
     start()
     init()
     log.info("active " + uuid)
-    def components(option: String, timeoutSeconds: Int = -1): Seq[Component] = {
+    def components(option: String, localComponentsPath: File, timeoutSeconds: Int = -1): Seq[Component] = {
       log.debug("get components [" + option + "] with timeout " + timeoutSeconds + "s")
-      val a = bestEntity.map(entity => Archinid.components(entity.bot, entity.target, option, timeoutSeconds))
-      /*match {
-	case Some(n) => n
-	case None => Seq()
-	}*/
-      null
+      bestEntity.map(entity => Archinid.components(entity.bot, entity.target, option, localComponentsPath, timeoutSeconds)).getOrElse(Seq())
     }
     def status(timeout: Int = 60000): Option[Info] = {
       log.debug("get status with timeout " + timeout)
@@ -201,7 +186,7 @@ object Archinid {
         case None => false
       }
   }
-  def components(bot: Bot, target: String, option: String, timeoutSeconds: Int = -1): Seq[Component] = {
+  def components(bot: Bot, target: String, option: String, localComponentsPath: File,  timeoutSeconds: Int = -1): Seq[Component] = {
     log.debug("get components [" + option + "] with timeout " + timeoutSeconds + "s from " + target)
     val componentEntry = """"(Documentum-Elasticus-\S+)", .*""".r
     val requestComponent = Request(target, bot, Request.Message.Simple("components " + option))
@@ -223,15 +208,15 @@ object Archinid {
                 log.warn("skip component " + componentName)
                 throw new RuntimeException // switch to onFail
               } else {
-                componentsParseDetails(str)
+                componentsParseDetails(str, localComponentsPath)
               }
             }
           })
           requestDetails.setRetry(3)
           requestDetails.setTimeoutSeconds(if (timeoutSeconds < 0) (bot.timeout / 1000) * 3 else timeoutSeconds)
           requestDetails.setLogger(log)
-          requestDetails.send[Option[Component]].getOrElse(null)
-        }).filter(_ != null).seq
+          requestDetails.send[Option[Component]]
+        }).seq.flatMap((x) => x) // Seq[Option[Component]] => Seq[Component] or .collect {case Some(x) => x}
       }
     })
     requestComponent.setRetry(3)
@@ -239,11 +224,11 @@ object Archinid {
     requestComponent.setLogger(log)
     requestComponent.send[Option[Seq[Component]]].getOrElse(Seq())
   }
-  private def componentsParseDetails(block: String): Option[Component] = {
+  private def componentsParseDetails(block: String, localComponentsPath: File): Option[Component] = {
     log.debug("parse component information")
     val replyMap: HashMap[String, Any] = HashMap()
-    var versions: Map[String, Map[String, String]] = Map()
-    var currentVersion: Tuple3[String, String, String] = Tuple3("", "", "") // name, id, url
+    var versions: Map[String, Component.Version] = Map()
+    var currentVersion: Tuple3[String, String, String] = Tuple3("", "", "") // name, id/hash, url/base
     var currentVersionMap: Map[String, String] = Map()
     block.split("\n").foreach(str => {
       val versionRegEx = """VERSION: (.*) \(([a-f0-9]+)\) at (.*)""".r
@@ -260,7 +245,7 @@ object Archinid {
         case str if str.startsWith("OPEN_ISSUES: ") => replyMap.update("open_issues", str.substring(13))
         case str if str.startsWith("VERSION: ") =>
           if (currentVersion._1 != "")
-            versions = versions.updated(currentVersion._1, currentVersionMap)
+            versions = versions.updated(currentVersion._1, Component.Version(currentVersion._1, currentVersion._2, currentVersion._3, currentVersionMap))
           val versionRegEx(pName, pID, pURL) = str
           currentVersion = Tuple3(pName, pID, pURL)
           currentVersionMap = Map()
@@ -275,7 +260,7 @@ object Archinid {
       }
     })
     if (currentVersion != "")
-      versions = versions.updated(currentVersion._1, currentVersionMap)
+      versions = versions.updated(currentVersion._1, Component.Version(currentVersion._1, currentVersion._2, currentVersion._3, currentVersionMap))
     // instantiate component
     Some(new Component(replyMap.getOrElse("url", "http://").asInstanceOf[String],
       replyMap.getOrElse("homepage", "http://").asInstanceOf[String],
@@ -286,7 +271,7 @@ object Archinid {
       replyMap.getOrElse("name", "lost").asInstanceOf[String],
       replyMap.getOrElse("description", "lost").asInstanceOf[String],
       replyMap.getOrElse("open_issues", "0").asInstanceOf[String].toInt,
-      null))
+      versions, new File(new File(localComponentsPath, replyMap.getOrElse("name", "lost").asInstanceOf[String]), ".component.xml")))
   }
   def status(bot: Bot, target: String, timeoutSeconds: Int = -1): Option[Info] = {
     log.debug("get status with timeout " + timeoutSeconds + "s")

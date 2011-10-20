@@ -139,10 +139,8 @@ class Hexapod(val uuid: UUID, val kind: String = "hexapod", val log: Logger = Lo
       val subscriber = new Subscriber[BotEvent, bot.Pub] {
         def notify(pub: bot.Pub, event: BotEvent): Unit = {
           event match {
-            case Bot.Event.SendMessage(_, _) =>
-              entity(bot).health = true
-              entity(bot).lastActivity = System.currentTimeMillis()
             case Bot.Event.ReceiveMessage(_, _) =>
+              entity(bot).health = true
               entity(bot).lastActivity = System.currentTimeMillis()
             case Bot.Event.Disconnected =>
               entity(bot).health = false

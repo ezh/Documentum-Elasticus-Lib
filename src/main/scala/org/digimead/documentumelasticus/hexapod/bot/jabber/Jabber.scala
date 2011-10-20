@@ -345,28 +345,34 @@ trait JabberEntity extends Bot with SubscribeSelf[BotEvent] {
       for (i <- 0 to 50 if (!connection.isConnected))
         Thread.sleep(100)
       if (connection.isConnected) {
-        connection.login(nick, password)
-        for (i <- 0 to 50 if (!connection.isAuthenticated))
-          Thread.sleep(100)
-        if (connection.isAuthenticated) {
-          /*          connection.addPacketListener(new PacketListener() { def processPacket(p: Packet) = log.debug("INBOUND " + p) },
+        try {
+          connection.login(nick, password)
+          for (i <- 0 to 50 if (!connection.isAuthenticated))
+            Thread.sleep(100)
+          if (connection.isAuthenticated) {
+            /*          connection.addPacketListener(new PacketListener() { def processPacket(p: Packet) = log.debug("INBOUND " + p) },
             new PacketFilter() { def accept(p: Packet): Boolean = { true } })
           connection.addPacketWriterListener(new PacketListener() { def processPacket(p: Packet) = log.debug("OUTBOUND " + p) },
             new PacketFilter() { def accept(p: Packet): Boolean = { true } })*/
-          val roster = connection.getRoster()
-          // some XMPP server configs do not give you a Roster.
-          if (roster != null)
-            roster.addRosterListener(rosterListener)
-          // manage the remotely created chats, so we don't miss incomming messages
-          val chatManager = connection.getChatManager
-          chatManager.addChatListener(chatListener)
-          roster.setSubscriptionMode(Roster.SubscriptionMode.accept_all)
-          connection.addConnectionListener(connectionListener) // step skipped if already in use
-          true
-        } else {
-          authFailCounter.incrementAndGet
-          log.warn("authentification failed")
-          false
+            val roster = connection.getRoster()
+            // some XMPP server configs do not give you a Roster.
+            if (roster != null)
+              roster.addRosterListener(rosterListener)
+            // manage the remotely created chats, so we don't miss incomming messages
+            val chatManager = connection.getChatManager
+            chatManager.addChatListener(chatListener)
+            roster.setSubscriptionMode(Roster.SubscriptionMode.accept_all)
+            connection.addConnectionListener(connectionListener) // step skipped if already in use
+            true
+          } else {
+            authFailCounter.incrementAndGet
+            log.warn("authentification failed")
+            false
+          }
+        } catch {
+          case e =>
+            log.warn(e.getMessage, e)
+            false
         }
       } else {
         log.warn("connection failed")
